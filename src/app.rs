@@ -76,8 +76,13 @@ pub struct App {
 
 pub fn run(autostart: bool) -> Result<()> {
     sys::init_process();
+    sys::set_app_id();
     let Some(_instance) = sys::single_instance() else {
-        log::info!("Veyra läuft bereits.");
+        // Erneut gestartet (Verknüpfung, angeheftete Kachel …): Einstellungen zeigen statt still zu beenden.
+        if !autostart {
+            log::info!("Veyra läuft bereits – öffne die Einstellungen");
+            sys::open_settings();
+        }
         return Ok(());
     };
     if autostart {

@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::Duration;
-use windows::core::{w, BOOL, HSTRING, PCWSTR};
+use windows::core::{w, Interface, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::*;
@@ -41,6 +41,8 @@ pub const AUTOSTART_ARG: &str = "--autostart";
 /// Kommandozeilen-Schalter für das Einstellungsfenster.
 pub const SETTINGS_ARG: &str = "--settings";
 pub const SETTINGS_TITLE: &str = "Veyra – Einstellungen";
+/// Gemeinsame App-Kennung aller Veyra-Prozesse (Taskleiste, Startmenü, Anheften).
+const APP_ID: &str = "w3ssy.Veyra";
 
 /// Ereignisse aus den Fensterprozeduren an die App.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,18 +139,111 @@ pub fn open_settings() {
 
 /// Holt ein offenes Einstellungsfenster nach vorne. `false`, wenn keins offen ist.
 pub fn focus_settings() -> bool {
+    let Some(h) = settings_window() else { return false };
     unsafe {
-        match FindWindowW(PCWSTR::null(), &HSTRING::from(SETTINGS_TITLE)) {
-            Ok(h) if !h.is_invalid() => {
-                if IsIconic(h).as_bool() {
-                    let _ = ShowWindow(h, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(h);
-                true
-            }
-            _ => false,
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+    }
+    true
+}
+
+pub fn settings_window() -> Option<HWND> {
+    unsafe { FindWindowW(PCWSTR::null(), &HSTRING::from(SETTINGS_TITLE)).ok().filter(|h| !h.is_invalid()) }
+}
+
+// ───────────────────────────── Startmenü & Anheften ─────────────────────────────
+
+/// Alle Veyra-Prozesse unter einer App-Kennung – sonst ordnet Windows Fenster, angeheftete Kacheln
+/// und den Startmenü-Eintrag nicht einander zu.
+pub fn set_app_id() {
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID));
+    }
+}
+
+/// Beim Anheften des Einstellungsfensters merkt sich Windows sonst nur `veyra.exe` (ohne `--settings`) –
+/// ein Klick auf die Kachel würde dann kein Fenster öffnen. Diese Fenster-Eigenschaften legen fest,
+/// was die angeheftete Kachel startet.
+pub fn set_relaunch_command(hwnd: HWND) -> Result<()> {
+    use windows::Win32::Storage::EnhancedStorage::*;
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+    let exe = std::env::current_exe()?;
+    let command = format!("\"{}\" {SETTINGS_ARG}", exe.display());
+    let icon = format!("{},0", exe.display());
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd)?;
+        // Die Kennung muss zuerst gesetzt sein, sonst ignoriert Windows den Neustart-Befehl.
+        store.SetValue(&PKEY_AppUserModel_ID, &lpwstr(APP_ID))?;
+        store.SetValue(&PKEY_AppUserModel_RelaunchCommand, &lpwstr(command.as_str()))?;
+        store.SetValue(&PKEY_AppUserModel_RelaunchDisplayNameResource, &lpwstr("Veyra"))?;
+        store.SetValue(&PKEY_AppUserModel_RelaunchIconResource, &lpwstr(icon.as_str()))?;
+        store.Commit()?;
+    }
+    Ok(())
+}
+
+/// Shell-Eigenschaften (App-Kennung, Neustart-Befehl) müssen VT_LPWSTR sein – `PROPVARIANT::from(&str)`
+/// erzeugt einen BSTR, den die Shell mit „Falscher Parameter“ ablehnt.
+fn lpwstr(s: &str) -> windows::Win32::System::Com::StructuredStorage::PROPVARIANT {
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    let mut pv = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::default();
+    // SHStrDupW reserviert mit CoTaskMemAlloc – genau das gibt PropVariantClear beim Drop wieder frei.
+    if let Ok(p) = unsafe { SHStrDupW(&HSTRING::from(s)) } {
+        unsafe {
+            (*pv.Anonymous.Anonymous).vt = VT_LPWSTR;
+            (*pv.Anonymous.Anonymous).Anonymous.pwszVal = p;
         }
     }
+    pv
+}
+
+fn start_menu_link() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs\\Veyra.lnk"))
+}
+
+/// Gibt es den Startmenü-Eintrag?
+pub fn start_menu_entry() -> bool {
+    start_menu_link().is_some_and(|p| p.is_file())
+}
+
+/// Startmenü-Eintrag „Veyra“ (öffnet die Einstellungen) anlegen bzw. entfernen. Von dort lässt sich Veyra
+/// an Start oder an die Taskleiste anheften. Liegt nur im eigenen Benutzerprofil, keine Adminrechte.
+pub fn set_start_menu_entry(on: bool) -> Result<()> {
+    let link = start_menu_link().context("APPDATA nicht gesetzt")?;
+    if !on {
+        if link.is_file() {
+            std::fs::remove_file(&link).context("Startmenü-Eintrag entfernen")?;
+        }
+        return Ok(());
+    }
+    write_shortcut(&link, &std::env::current_exe()?)
+}
+
+/// Verknüpfung `link` → `exe --settings` mit Veyras App-Kennung schreiben.
+fn write_shortcut(link: &Path, exe: &Path) -> Result<()> {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).context("CoCreateInstance")?;
+        sl.SetPath(&HSTRING::from(exe.as_os_str())).context("SetPath")?;
+        sl.SetArguments(&HSTRING::from(SETTINGS_ARG)).context("SetArguments")?;
+        sl.SetDescription(w!("Veyra – Video-Hintergründe für den Desktop")).context("SetDescription")?;
+        sl.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0).context("SetIconLocation")?;
+        if let Some(dir) = exe.parent() {
+            sl.SetWorkingDirectory(&HSTRING::from(dir.as_os_str())).context("SetWorkingDirectory")?;
+        }
+        let store: IPropertyStore = sl.cast().context("cast")?;
+        store.SetValue(&PKEY_AppUserModel_ID, &lpwstr(APP_ID)).context("SetValue")?;
+        store.Commit().context("Commit")?;
+        let file: IPersistFile = sl.cast().context("cast")?;
+        file.Save(&HSTRING::from(link.as_os_str()), true).context("Startmenü-Eintrag speichern")?;
+    }
+    Ok(())
 }
 
 /// Beim Autostart: warten, bis Explorer Taskleiste und Desktop fertig aufgebaut hat (höchstens `max`).
@@ -854,4 +949,19 @@ unsafe fn class_name(hwnd: HWND) -> String {
 
 unsafe fn is_shell_window(hwnd: HWND) -> bool {
     matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shortcut_is_written() {
+        let dir = std::env::temp_dir().join(format!("veyra-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("Veyra.lnk");
+        // SetPath verlangt eine vorhandene Datei – die Test-EXE selbst.
+        let exe = std::env::current_exe().unwrap();
+        super::write_shortcut(&link, &exe).unwrap();
+        assert!(link.metadata().unwrap().len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

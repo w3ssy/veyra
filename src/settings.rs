@@ -17,10 +17,21 @@ const CYAN: Color32 = Color32::from_rgb(0x22, 0xD3, 0xEE);
 const THUMB_W: u32 = 320;
 
 pub fn run() -> Result<()> {
+    sys::set_app_id();
     let Some(_guard) = sys::settings_instance() else {
         sys::focus_settings();
         return Ok(());
     };
+    // Über Startmenü oder angeheftete Kachel geöffnet: Das Wallpaper soll dann auch laufen.
+    if !sys::wallpaper_running() {
+        sys::spawn_self(&[]);
+    }
+    // Eintrag aktuell halten, falls die EXE inzwischen woanders liegt.
+    if sys::start_menu_entry() {
+        if let Err(e) = sys::set_start_menu_entry(true) {
+            log::warn!("Startmenü-Eintrag aktualisieren: {e:#}");
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(sys::SETTINGS_TITLE)
         .with_inner_size([1000.0, 720.0])
@@ -158,6 +169,10 @@ struct Settings {
     library: Vec<PathBuf>,
     thumbs: Thumbs,
     tab: Tab,
+    /// Startmenü-Eintrag vorhanden (wird sofort angelegt/entfernt, nicht über „Speichern“).
+    start_menu: bool,
+    /// Neustart-Befehl fürs Anheften schon am Fenster gesetzt?
+    relaunch_set: bool,
     status: Option<(String, bool, Instant)>,
 }
 
@@ -186,6 +201,8 @@ impl Settings {
             library: Vec::new(),
             thumbs: Thumbs::new(ctx),
             tab: Tab::Wallpaper,
+            start_menu: sys::start_menu_entry(),
+            relaunch_set: false,
             status: None,
             path,
         };
@@ -323,6 +340,15 @@ impl eframe::App for Settings {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.thumbs.poll(&ctx);
+        // Sobald das Fenster existiert: festlegen, was eine angeheftete Kachel startet.
+        if !self.relaunch_set {
+            if let Some(h) = sys::settings_window() {
+                if let Err(e) = sys::set_relaunch_command(h) {
+                    log::warn!("Anheften vorbereiten: {e:#}");
+                }
+                self.relaunch_set = true;
+            }
+        }
         self.watch_file();
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
@@ -620,9 +646,26 @@ impl Settings {
     }
 
     fn general_tab(&mut self, ui: &mut egui::Ui) {
-        let g = &mut self.cfg.general;
         Self::section(ui, "Start");
-        ui.checkbox(&mut g.autostart, "Mit Windows starten");
+        ui.checkbox(&mut self.cfg.general.autostart, "Mit Windows starten");
+        let mut start_menu = self.start_menu;
+        ui.checkbox(&mut start_menu, "Im Startmenü anzeigen")
+            .on_hover_text("Danach im Startmenü bei „Alle Apps“ → Veyra → Rechtsklick → „An Start anheften“ oder „An Taskleiste anheften“");
+        if start_menu != self.start_menu {
+            match sys::set_start_menu_entry(start_menu) {
+                Ok(()) => {
+                    self.start_menu = start_menu;
+                    let msg = if start_menu {
+                        "Im Startmenü eingetragen – dort Rechtsklick auf „Veyra“ → „An Start anheften“."
+                    } else {
+                        "Startmenü-Eintrag entfernt."
+                    };
+                    self.set_status(msg.into(), false);
+                }
+                Err(e) => self.set_status(format!("Startmenü-Eintrag: {e:#}"), true),
+            }
+        }
+        let g = &mut self.cfg.general;
 
         Self::section(ui, "Automatisch pausieren, wenn …");
         ui.checkbox(&mut g.pause_on_fullscreen, "… ein Spiel oder Vollbild-Video auf dem Monitor läuft");

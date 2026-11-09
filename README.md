@@ -81,6 +81,11 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
    - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
 3. **Speichern** (oder Strg+S) – Veyra übernimmt die Änderung sofort.
 
+**An Start oder Taskleiste anheften:** Einstellungen → Allgemein → **Im Startmenü anzeigen** aktivieren,
+dann im Startmenü unter „Alle Apps“ Rechtsklick auf **Veyra** → „An Start anheften“ bzw. „An Taskleiste anheften“.
+Alternativ das offene Einstellungsfenster in der Taskleiste per Rechtsklick anheften. Ein Klick darauf öffnet
+die Einstellungen und startet Veyra, falls es nicht läuft; ein erneuter Start von `veyra.exe` ebenso.
+
 Wer lieber eine Textdatei bearbeitet: Tray → **config.toml bearbeiten…** öffnet `%APPDATA%\Veyra\config.toml`;
 Änderungen werden nach ~1 s automatisch übernommen.
 
