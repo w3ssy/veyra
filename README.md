@@ -10,7 +10,7 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%20%7C%2011-0078D6?logo=windows)
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?logo=rust)
 ![Lizenz](https://img.shields.io/badge/Lizenz-MIT-green)
-![Status](https://img.shields.io/badge/Status-MVP-orange)
+![Status](https://img.shields.io/badge/Status-Beta-yellow)
 
 </div>
 
@@ -20,6 +20,7 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 
 - 🎬 **Video-Wallpaper** – MP4/H.264, H.265/HEVC, VP9, AV1 (alles, was Windows' Media Foundation kann), in Endlosschleife
 - ⚡ **Hardware-Dekodierung** über die GPU – Ton wird nie dekodiert
+- 🚀 **Zero-Copy** – dekodierte Bilder bleiben im Grafikspeicher und werden direkt gezeichnet (DX12)
 - 🖥️ **Multi-Monitor** – pro Bildschirm ein eigenes Video oder ein Video für alle (wird dann nur einmal dekodiert)
 - ⏸️ **Auto-Pause** bei Vollbild-Spielen/-Videos, maximierten Fenstern (optional), Akkubetrieb und Sperrbildschirm
 - 🔊 **Audio-reaktiv** – Effekte `pulse`, `glow` und `chroma` reagieren auf den Systemsound (WASAPI-Loopback)
@@ -27,6 +28,7 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 - 📚 **Video-Bibliothek** – ein Ordner (Standard: „Videos“), dessen Videos mit Vorschaubild zur Auswahl stehen
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
+- 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
@@ -43,8 +45,8 @@ Videos effizient als Hintergrund abspielen.
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
 | Netzwerk | Kein einziger Netzwerkaufruf im Code |
-| Codebasis | ~3.800 Zeilen Rust, 9 direkte Abhängigkeiten |
-| Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist – und pausiert, wenn niemand hinsieht |
+| Codebasis | ~4.500 Zeilen Rust, 9 direkte Abhängigkeiten |
+| Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist, Bilder verlassen nie den Grafikspeicher – und pausiert, wenn niemand hinsieht |
 
 ## Download
 
@@ -53,7 +55,7 @@ und starten (keine Installation, keine Adminrechte). Die `.sha256`-Datei daneben
 
 ## Bauen (Windows)
 
-1. Rust installieren: <https://rustup.rs> (Standard-Toolchain `x86_64-pc-windows-msvc`).
+1. Rust installieren: <https://rustup.rs> (Standard-Toolchain `x86_64-pc-windows-msvc`, mindestens Rust 1.95).
    Dafür werden die *Visual Studio Build Tools* mit „Desktopentwicklung mit C++“ benötigt.
 2. Repository klonen und bauen:
 
@@ -90,15 +92,15 @@ Wer lieber eine Textdatei bearbeitet: Tray → **config.toml bearbeiten…** öf
 Änderungen werden nach ~1 s automatisch übernommen.
 
 ```toml
+[library]
+folder = 'D:\Wallpaper'  # Ordner für die Bibliothek im Einstellungsfenster (leer = "Videos")
+
 [[wallpaper]]
 monitor = "all"
 video = 'C:\Users\<name>\Videos\regen.mp4'
 fit = "cover"
 effect = "pulse"
 intensity = 1.0
-
-[library]
-folder = 'D:\Wallpaper'  # Ordner für die Bibliothek im Einstellungsfenster (leer = "Videos")
 
 [[wallpaper]]            # Monitor 2 bekommt ein eigenes Video
 monitor = 2
@@ -118,6 +120,9 @@ Monitore werden **von links nach rechts** ab 1 gezählt; die Zuordnung steht bei
   (`-an` entfernt die Tonspur).
 - H.264 oder HEVC werden praktisch überall in Hardware dekodiert; AV1 nur auf neueren GPUs.
 - `max_fps = 30` und `gpu = "low"` (integrierte GPU) sind auf Laptops die sparsamste Wahl.
+- **Desktop-PC mit Grafikkarte:** Hängen die Monitore an der dedizierten GPU, ist `gpu = "high"` meist deutlich
+  sparsamer als `"low"` – sonst rechnet die schwache iGPU, und Windows kopiert jedes Bild zwischen den Grafikkarten.
+- Im Log steht, welche GPU gewählt wurde und ob Zero-Copy aktiv ist („Zero-Copy aktiv“ bzw. „über Arbeitsspeicher“).
 
 ## Sicherheit prüfen
 
@@ -130,15 +135,17 @@ Siehe Abschnitt „Sicherheitsmodell“ in [docs/ARCHITEKTUR.md](docs/ARCHITEKTU
 
 ## Stand
 
-Veyra ist ein **MVP**. Der Code ist gegen das Windows-Ziel (`x86_64-pc-windows-msvc`) gebaut und
-Clippy-sauber, die plattformunabhängigen Teile sind mit Unit-Tests abgedeckt.
+Veyra ist in der **Beta** (v0.2). Getestet unter Windows 11 24H2 mit AMD- und NVIDIA-Grafik; jeder Push
+wird per GitHub Actions mit Clippy und Unit-Tests geprüft.
 Je nach Windows-Version und Grafiktreiber kann es noch Ecken geben – v. a. bei der Desktop-Einbettung
-(Windows 11 24H2+) und der NV12-Pufferaufteilung einzelner Treiber.
+und bei Zero-Copy (fällt bei Problemen automatisch auf den Weg über den Arbeitsspeicher zurück).
+**Windows auf ARM** (Snapdragon) ist ungetestet; die x64-EXE sollte dort über die Windows-Emulation laufen.
 Das Log (`%APPDATA%\Veyra\veyra.log`) zeigt, wo es hakt – Issues mit Log-Auszug sind willkommen.
 
 ## Mitmachen
 
-Bug-Reports, Ideen und Pull Requests sind willkommen! Bitte vor einem PR `cargo clippy` und `cargo test` ausführen.
+Bug-Reports, Ideen und Pull Requests sind willkommen! Bitte vor einem PR `cargo clippy -- -D warnings`
+und `cargo test` ausführen (so prüft auch die CI).
 
 ## Lizenz
 

@@ -114,7 +114,8 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
   Veyra selbst enthält keinen Medienparser.
 - **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. (Prüfbar: `grep -ri "http\|socket" src/`.)
   `MFSTARTUP_NOSOCKET` verhindert zusätzlich, dass Media Foundation Netzwerkquellen öffnet.
-- **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra` und `HKCU\…\Run` (Autostart).
+- **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra`, `HKCU\…\Run` (Autostart) und – nur wenn in den
+  Einstellungen aktiviert – eine Verknüpfung ins eigene Startmenü (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`).
 - **Speichersicher**: Rust; `unsafe` nur an den Grenzen zu Win32/COM, jeweils gekapselt.
 - **Wenige Abhängigkeiten**: `wgpu`, `windows`, `rustfft`, `serde`, `toml`, `anyhow`, `log`, `pollster` –
   plus `eframe`/egui (nur für das Einstellungsfenster, ohne Netzwerk-/Link-Features).
