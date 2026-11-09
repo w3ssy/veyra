@@ -1,0 +1,19 @@
+# Rust build output
+/target
+
+# Lokale Test-Videos im Projekt-Root (nicht veröffentlichen)
+/*.mp4
+/*.webm
+/*.mkv
+/*.mov
+/*.avi
+/*.m4v
+/*.wmv
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
