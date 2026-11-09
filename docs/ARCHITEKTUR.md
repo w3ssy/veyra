@@ -136,8 +136,8 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
 
 ## Roadmap
 
-1. **v0.1 (dieser Stand)**: Video, Multi-Monitor, Auto-Pause, Tray, Autostart, Audio-Effekte.
-2. **v0.2**: Praxistest auf Win10/Win11 23H2/24H2, Fehlerkorrekturen; signierte Release-Builds.
+1. **v0.1**: Video, Multi-Monitor, Auto-Pause, Tray, Autostart, Audio-Effekte.
+2. **v0.2 (dieser Stand)**: Praxistest auf Win10/Win11 23H2/24H2, Fehlerkorrekturen; signierte Release-Builds.
    *(Erledigt: Einstellungsfenster mit Monitor-Übersicht und Video-Bibliothek, Pause bei ausgeschaltetem Bildschirm,
    Wächter für die Desktop-Einbettung, Release-Builds per GitHub Actions.)* *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
    ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*

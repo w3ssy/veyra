@@ -1,6 +1,6 @@
 [package]
 name = "veyra"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Veyra – Motion for your universe. Schlanke, sichere Video-Hintergründe für den Desktop (Windows, später Linux)"
 license = "MIT"
