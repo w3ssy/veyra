@@ -1,8 +1,8 @@
 <div align="center">
 
-# Veyra
+<img src="assets/veyra-logo.png" alt="Veyra" width="440">
 
-**Veyra – Motion for your universe.**
+**Motion for your universe.**
 
 Schlanke, sichere Video-Hintergründe für den Windows-Desktop.<br>
 Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleunigt hinter deinen Desktop-Symbolen.
@@ -23,7 +23,7 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 - 🖥️ **Multi-Monitor** – pro Bildschirm ein eigenes Video oder ein Video für alle (wird dann nur einmal dekodiert)
 - ⏸️ **Auto-Pause** bei Vollbild-Spielen/-Videos, maximierten Fenstern (optional), Akkubetrieb und Sperrbildschirm
 - 🔊 **Audio-reaktiv** – Effekte `pulse`, `glow` und `chroma` reagieren auf den Systemsound (WASAPI-Loopback)
-- 🧭 **Tray-Icon** mit Menü und **Autostart** mit Windows
+- 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
@@ -59,6 +59,9 @@ Videos effizient als Hintergrund abspielen.
 
 Zum Entwickeln mit Konsolenausgabe: `cargo run` (Debug-Build zeigt Logs im Terminal).
 Ausführlichere Logs: Umgebungsvariable `VEYRA_LOG=debug` setzen.
+
+Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python assets/make_icons.py`
+(benötigt Pillow, NumPy, SciPy).
 
 ## Benutzen
 

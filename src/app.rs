@@ -134,10 +134,12 @@ impl App {
             Event::TrayActivate => self.toggle_pause(),
             Event::ShellRestarted => {
                 log::info!("Explorer neu gestartet – baue Wallpaper neu auf");
+                self.tray.refresh_icon();
                 self.tray.add();
                 self.schedule_rebuild(Duration::from_millis(1500));
             }
             Event::DisplayChanged => self.schedule_rebuild(Duration::from_millis(800)),
+            Event::ThemeChanged => self.tray.refresh_icon(),
             Event::Locked(l) => self.locked = l,
             Event::Quit => self.quit = true,
         }

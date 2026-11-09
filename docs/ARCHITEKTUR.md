@@ -121,6 +121,7 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
 
 1. **v0.1 (dieser Stand)**: Video, Multi-Monitor, Auto-Pause, Tray, Autostart, Audio-Effekte.
 2. **v0.2**: Praxistest auf Win10/Win11 23H2/24H2, Fehlerkorrekturen; Pause bei ausgeschaltetem Bildschirm;
-   eigenes Programmsymbol (`.ico` via `winres`); signierte Release-Builds.
+   signierte Release-Builds. *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
+   ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*
 3. **v0.3**: Zero-Copy-Pfad; kleines Einstellungsfenster statt TOML (optional).
 4. **v0.4**: Linux (Wayland zuerst).

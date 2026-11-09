@@ -37,6 +37,8 @@ pub enum Event {
     /// Explorer wurde neu gestartet → Fenster und Tray-Icon neu anlegen.
     ShellRestarted,
     DisplayChanged,
+    /// Hell/Dunkel-Modus der Taskleiste geändert → Tray-Icon tauschen.
+    ThemeChanged,
     Locked(bool),
     Quit,
 }
@@ -376,6 +378,13 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             push(Event::DisplayChanged);
             LRESULT(0)
         }
+        WM_SETTINGCHANGE => {
+            let area = PCWSTR(lp.0 as *const u16);
+            if !area.is_null() && area.to_string().is_ok_and(|a| a == "ImmersiveColorSet") {
+                push(Event::ThemeChanged);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_WTSSESSION_CHANGE => {
             match wp.0 {
                 WTS_SESSION_LOCK => push(Event::Locked(true)),
@@ -404,9 +413,20 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(control: &ControlWindow) -> Self {
-        let tray = Self { hwnd: control.hwnd, icon: make_icon() };
+        let tray = Self { hwnd: control.hwnd, icon: load_tray_icon() };
         tray.add();
         tray
+    }
+
+    /// Icon neu laden (Theme-Wechsel, Explorer-Neustart mit anderer DPI).
+    pub fn refresh_icon(&mut self) {
+        let old = std::mem::replace(&mut self.icon, load_tray_icon());
+        let mut nid = self.data();
+        nid.uFlags = NIF_ICON;
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+            let _ = DestroyIcon(old);
+        }
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -478,32 +498,38 @@ impl Drop for Tray {
     }
 }
 
-/// Kleines eigenes Symbol (32×32, Farbverlauf) – keine Ressourcendatei nötig.
-fn make_icon() -> HICON {
-    const S: usize = 32;
-    let mut color = vec![0u8; S * S * 4];
-    let mask = [0u8; S * S / 8]; // AND-Maske leer → Alpha-Kanal entscheidet
-    for y in 0..S {
-        for x in 0..S {
-            let (fx, fy) = (x as f32 - 15.5, y as f32 - 15.5);
-            // Abgerundetes Quadrat
-            let d = (fx.abs() - 11.0).max(0.0).hypot((fy.abs() - 11.0).max(0.0));
-            let a = (4.5 - d).clamp(0.0, 1.0);
-            let t = y as f32 / S as f32;
-            // Drei "Hügel"-Streifen wie eine Landschaftskulisse
-            let hill = fy > 4.0 * (fx * 0.25).sin() + 2.0;
-            let (r, g, b) = if hill { (40.0, 30.0 + 60.0 * t, 90.0) } else { (110.0 + 120.0 * t, 80.0 + 40.0 * t, 230.0 - 60.0 * t) };
-            let i = (y * S + x) * 4;
-            color[i] = (b * a) as u8;
-            color[i + 1] = (g * a) as u8;
-            color[i + 2] = (r * a) as u8;
-            color[i + 3] = (a * 255.0) as u8;
-        }
-    }
+/// Ressourcen-IDs aus `build.rs`.
+const ICON_TRAY_LIGHT: u16 = 2;
+const ICON_TRAY_DARK: u16 = 3;
+
+/// Tray-Icon aus der EXE laden: weißes Symbol auf dunkler, dunkles Symbol auf heller Taskleiste.
+/// Größe = kleines System-Icon (16 px bei 100 %, 24 px bei 150 % …); Windows wählt die passende Stufe.
+fn load_tray_icon() -> HICON {
+    let id = if taskbar_is_light() { ICON_TRAY_DARK } else { ICON_TRAY_LIGHT };
     unsafe {
+        let size = GetSystemMetrics(SM_CXSMICON);
         let hinst = GetModuleHandleW(None).ok().map(|h| h.into());
-        CreateIcon(hinst, S as i32, S as i32, 1, 32, mask.as_ptr(), color.as_ptr())
+        LoadImageW(hinst, PCWSTR(id as usize as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
+            .map(|h| HICON(h.0))
             .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default())
+    }
+}
+
+fn taskbar_is_light() -> bool {
+    let mut value = 0u32;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut len),
+        )
+        .is_ok()
+            && value != 0
     }
 }
 
