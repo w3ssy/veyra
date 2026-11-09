@@ -48,7 +48,7 @@ fn window_icon() -> Option<egui::IconData> {
         let pixels = data.get(40..40 + size * size * 4)?; // BITMAPINFOHEADER, dann BGRA von unten nach oben
         let mut rgba = Vec::with_capacity(size * size * 4);
         for row in pixels.chunks_exact(size * 4).rev() {
-            for p in row.chunks_exact(4) {
+            for p in row.as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
             }
         }
