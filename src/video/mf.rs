@@ -1,7 +1,7 @@
 //! Media Foundation: in Windows eingebauter, per Windows Update gepflegter Dekoder.
 //! Hardware-Dekodierung (DXVA) über ein eigenes D3D11-Gerät, Ausgabe NV12, Endlosschleife.
 
-use super::Frame;
+use super::{DecodeOptions, Frame};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,20 +29,20 @@ struct Format {
     bt709: bool,
 }
 
-pub fn decode_loop(path: &Path, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
+pub fn decode_loop(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
     if !path.is_file() {
         bail!("Datei nicht gefunden");
     }
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
-        let r = run(path, tx, pool, stop);
+        let r = run(path, opts, tx, pool, stop);
         let _ = MFShutdown();
         r
     }
 }
 
-unsafe fn run(path: &Path, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
+unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
     let attrs = {
         let mut a = None;
         MFCreateAttributes(&mut a, 4)?;
@@ -50,11 +50,11 @@ unsafe fn run(path: &Path, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, sto
     };
 
     // Hardware-Dekodierung: D3D11-Gerät mit Video-Unterstützung an den Source Reader geben.
-    match create_dxgi_manager() {
-        Ok(mgr) => {
+    match create_dxgi_manager(opts.low_power) {
+        Ok((mgr, gpu)) => {
             attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &mgr)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            log::info!("Hardware-Dekodierung aktiv für {path:?}");
+            log::info!("Hardware-Dekodierung auf {gpu} für {path:?}");
         }
         Err(e) => log::warn!("Keine Hardware-Dekodierung ({e}), nutze Software-Dekoder"),
     }
@@ -75,6 +75,26 @@ unsafe fn run(path: &Path, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, sto
 
     let mut fmt = read_format(&reader)?;
     log::info!("{path:?}: {}x{}, {:.2} fps", fmt.width, fmt.height, 1.0 / fmt.frame_dur.as_secs_f64());
+
+    // Größer als der Monitor? Dann verkleinert der Videoprozessor auf der GPU – das spart vor allem
+    // das teure Zurücklesen jedes Bildes in den Arbeitsspeicher (4K → 1080p = ¼ der Daten).
+    if let Some((w, h)) = opts.max_size.and_then(|m| super::scaled_size((fmt.width, fmt.height), m)) {
+        let small = MFCreateMediaType()?;
+        small.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        small.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+        small.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
+        match reader.SetCurrentMediaType(FIRST_VIDEO, None, &small) {
+            Ok(()) => {
+                fmt = read_format(&reader)?;
+                log::info!("{path:?}: wird auf der GPU auf {}x{} verkleinert", fmt.width, fmt.height);
+            }
+            Err(e) => {
+                log::warn!("{path:?}: Verkleinern nicht möglich ({e}), dekodiere in voller Größe");
+                reader.SetCurrentMediaType(FIRST_VIDEO, None, &want)?;
+                fmt = read_format(&reader)?;
+            }
+        }
+    }
 
     let mut loop_base = Duration::ZERO;
     let mut last_pts = Duration::ZERO;
@@ -119,11 +139,23 @@ unsafe fn run(path: &Path, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, sto
     Ok(())
 }
 
-unsafe fn create_dxgi_manager() -> Result<IMFDXGIDeviceManager> {
+/// D3D11-Gerät für die Hardware-Dekodierung – auf derselben GPU-Sorte wie die Ausgabe (`gpu = "low"/"high"`).
+/// Sonst landet der Dekoder auf der Standard-GPU, und jedes Bild wandert zusätzlich zwischen zwei Grafikkarten.
+unsafe fn create_dxgi_manager(low_power: bool) -> Result<(IMFDXGIDeviceManager, String)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let pref = if low_power { DXGI_GPU_PREFERENCE_MINIMUM_POWER } else { DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE };
+    let adapter: Option<IDXGIAdapter1> =
+        CreateDXGIFactory1::<IDXGIFactory6>().ok().and_then(|f| f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, pref).ok());
+    let name = adapter
+        .as_ref()
+        .and_then(|a| a.GetDesc1().ok())
+        .map(|d| String::from_utf16_lossy(&d.Description[..d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len())]))
+        .unwrap_or_else(|| "Standard-GPU".into());
     let mut device: Option<ID3D11Device> = None;
     D3D11CreateDevice(
-        None,
-        D3D_DRIVER_TYPE_HARDWARE,
+        adapter.as_ref().map(|a| a.cast::<IDXGIAdapter>()).transpose()?.as_ref(),
+        // Mit vorgegebenem Adapter muss der Treibertyp UNKNOWN sein.
+        if adapter.is_some() { windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE },
         HMODULE::default(),
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         None,
@@ -142,7 +174,7 @@ unsafe fn create_dxgi_manager() -> Result<IMFDXGIDeviceManager> {
     MFCreateDXGIDeviceManager(&mut token, &mut mgr)?;
     let mgr = mgr.context("kein DXGI-Manager")?;
     mgr.ResetDevice(&device, token)?;
-    Ok(mgr)
+    Ok((mgr, name))
 }
 
 unsafe fn read_format(reader: &IMFSourceReader) -> Result<Format> {
@@ -228,4 +260,125 @@ unsafe fn copy_sample(sample: &IMFSample, fmt: &Format, mut data: Vec<u8>, pts: 
         bail!("Puffer zu klein ({len} < {needed})");
     }
     Ok(Frame { data, pitch: pitch as u32, width: fmt.width, height: fmt.height, y_rows: fmt.height, crop: fmt.crop, pts, bt709: fmt.bt709 })
+}
+
+// ───────────────────────────── Vorschaubild ─────────────────────────────
+
+/// Vorschaubild (ein Bild bei ~2 s) als RGBA, höchstens `max_w` Pixel breit. Software-Dekodierung,
+/// läuft im Einstellungsfenster in einem Hintergrund-Thread.
+pub fn thumbnail(path: &Path, max_w: u32) -> Result<(u32, u32, Vec<u8>)> {
+    if !path.is_file() {
+        bail!("Datei nicht gefunden");
+    }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
+        let r = thumbnail_inner(path, max_w.max(1));
+        let _ = MFShutdown();
+        r
+    }
+}
+
+unsafe fn thumbnail_inner(path: &Path, max_w: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let attrs = {
+        let mut a = None;
+        MFCreateAttributes(&mut a, 1)?;
+        a.context("MFCreateAttributes")?
+    };
+    // Lässt Media Foundation selbst nach RGB32 konvertieren.
+    attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
+    let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).context("Video öffnen")?;
+    reader.SetStreamSelection(ALL_STREAMS, false)?;
+    reader.SetStreamSelection(FIRST_VIDEO, true)?;
+    let want = MFCreateMediaType()?;
+    want.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    want.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+    reader.SetCurrentMediaType(FIRST_VIDEO, None, &want).context("kein RGB32")?;
+
+    let mt = reader.GetCurrentMediaType(FIRST_VIDEO)?;
+    let size = mt.GetUINT64(&MF_MT_FRAME_SIZE)?;
+    let (w, h) = ((size >> 32) as usize, (size & 0xFFFF_FFFF) as usize);
+    if w == 0 || h == 0 {
+        bail!("ungültige Bildgröße");
+    }
+    let default_stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(w as i32 * 4);
+
+    // Etwas hinter den Anfang springen – das erste Bild ist oft schwarz. Kurze Videos: von vorn.
+    for seek in [20_000_000i64, 0] {
+        let mut pos = PROPVARIANT::default();
+        (*pos.Anonymous.Anonymous).vt = VT_I8;
+        (*pos.Anonymous.Anonymous).Anonymous.hVal = seek;
+        let _ = reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &pos);
+        for _ in 0..60 {
+            let mut flags = 0u32;
+            let mut sample: Option<IMFSample> = None;
+            reader.ReadSample(FIRST_VIDEO, 0, None, Some(&mut flags), None, Some(&mut sample))?;
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+            if let Some(sample) = sample {
+                return rgb32_to_thumb(&sample, w, h, default_stride, max_w);
+            }
+        }
+    }
+    bail!("kein Bild gefunden")
+}
+
+unsafe fn rgb32_to_thumb(sample: &IMFSample, w: usize, h: usize, default_stride: i32, max_w: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let buffer = sample.ConvertToContiguousBuffer()?;
+    let (base, pitch, unlock2d) = if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
+        let mut scan0 = std::ptr::null_mut();
+        let mut pitch = 0i32;
+        b2.Lock2D(&mut scan0, &mut pitch)?;
+        (scan0 as *const u8, pitch as isize, Some(b2))
+    } else {
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        buffer.Lock(&mut ptr, None, Some(&mut len))?;
+        if (len as usize) < default_stride.unsigned_abs() as usize * h {
+            let _ = buffer.Unlock();
+            bail!("Puffer zu klein");
+        }
+        // Negativer Stride = Bild steht auf dem Kopf (bottom-up).
+        let base = if default_stride < 0 { ptr.add(default_stride.unsigned_abs() as usize * (h - 1)) } else { ptr };
+        (base as *const u8, default_stride as isize, None)
+    };
+
+    // Box-Filter: jedes Zielpixel mittelt seinen Quellbereich (sauberer als „nächster Nachbar“).
+    let tw = (max_w as usize).min(w);
+    let th = (h * tw / w).max(1);
+    let mut out = vec![0u8; tw * th * 4];
+    for ty in 0..th {
+        let (y0, y1) = (ty * h / th, ((ty + 1) * h / th).max(ty * h / th + 1));
+        for tx in 0..tw {
+            let (x0, x1) = (tx * w / tw, ((tx + 1) * w / tw).max(tx * w / tw + 1));
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            // Bei großen Bereichen nur jede zweite Zeile/Spalte – reicht für ein Vorschaubild.
+            let step = if (x1 - x0) * (y1 - y0) > 64 { 2 } else { 1 };
+            for y in (y0..y1).step_by(step) {
+                let row = base.offset(y as isize * pitch);
+                for x in (x0..x1).step_by(step) {
+                    let p = row.add(x * 4); // B G R X
+                    b += *p as u32;
+                    g += *p.add(1) as u32;
+                    r += *p.add(2) as u32;
+                    n += 1;
+                }
+            }
+            let o = (ty * tw + tx) * 4;
+            out[o] = (r / n) as u8;
+            out[o + 1] = (g / n) as u8;
+            out[o + 2] = (b / n) as u8;
+            out[o + 3] = 255;
+        }
+    }
+    match unlock2d {
+        Some(b2) => {
+            let _ = b2.Unlock2D();
+        }
+        None => {
+            let _ = buffer.Unlock();
+        }
+    }
+    Ok((tw as u32, th as u32, out))
 }

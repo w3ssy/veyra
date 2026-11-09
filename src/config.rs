@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub general: General,
     pub audio: Audio,
+    pub library: Library,
     #[serde(rename = "wallpaper")]
     pub wallpapers: Vec<Wallpaper>,
 }
@@ -28,6 +29,8 @@ pub struct General {
     pub pause_on_battery: bool,
     /// Pausieren, wenn die Sitzung gesperrt ist.
     pub pause_on_lock: bool,
+    /// Pausieren, wenn der Bildschirm ausgeschaltet ist (Energiesparen/Standby des Monitors).
+    pub pause_on_display_off: bool,
     /// "low" (iGPU, spart Strom) oder "high" (dedizierte GPU).
     pub gpu: GpuPreference,
     /// Grafik-Backend: "auto", "dx12" oder "vulkan".
@@ -58,6 +61,40 @@ pub struct Audio {
     pub sensitivity: f32,
     /// Glättung (0.0 = nervös, 0.95 = sehr träge).
     pub smoothing: f32,
+}
+
+/// Video-Bibliothek: Ordner, dessen Videos das Einstellungsfenster zur Auswahl anbietet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Library {
+    /// Leer = der Windows-Ordner „Videos“.
+    pub folder: PathBuf,
+}
+
+/// Dateiendungen, die als Video gelten (Bibliothek, Drag & Drop).
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv"];
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTENSIONS.iter().any(|v| v.eq_ignore_ascii_case(e)))
+}
+
+impl Library {
+    pub fn effective_folder(&self) -> PathBuf {
+        if !self.folder.as_os_str().is_empty() {
+            return self.folder.clone();
+        }
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
+        home.join("Videos")
+    }
+
+    /// Videos im Bibliotheksordner (nicht rekursiv), alphabetisch.
+    pub fn videos(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(self.effective_folder())
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && is_video(p)).collect())
+            .unwrap_or_default();
+        v.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        v
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,6 +145,7 @@ impl Default for General {
             pause_on_maximized: false,
             pause_on_battery: true,
             pause_on_lock: true,
+            pause_on_display_off: true,
             gpu: GpuPreference::Low,
             backend: Backend::Auto,
         }
@@ -134,7 +172,7 @@ impl Default for Wallpaper {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { general: General::default(), audio: Audio::default(), wallpapers: vec![Wallpaper::default()] }
+        Self { general: General::default(), audio: Audio::default(), library: Library::default(), wallpapers: vec![Wallpaper::default()] }
     }
 }
 
@@ -219,8 +257,13 @@ impl Config {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).with_context(|| format!("Ordner {dir:?} anlegen"))?;
             }
-            std::fs::write(path, DEFAULT_CONFIG).with_context(|| format!("{path:?} schreiben"))?;
-            log::info!("Standard-Konfiguration angelegt: {path:?}");
+            let legacy = legacy_config_path();
+            if legacy.is_file() && std::fs::copy(&legacy, path).is_ok() {
+                log::info!("Konfiguration aus {legacy:?} übernommen");
+            } else {
+                std::fs::write(path, render(&Config::default())).with_context(|| format!("{path:?} schreiben"))?;
+                log::info!("Standard-Konfiguration angelegt: {path:?}");
+            }
         }
         let text = std::fs::read_to_string(path).with_context(|| format!("{path:?} lesen"))?;
         let mut cfg: Config = toml::from_str(&text).with_context(|| format!("{path:?} ist kein gültiges TOML"))?;
@@ -241,6 +284,21 @@ pub fn config_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// Konfiguration aus der Zeit, als Veyra noch „Kulisse“ hieß – wird beim ersten Start übernommen.
+fn legacy_config_path() -> PathBuf {
+    let dir = config_dir();
+    dir.parent().unwrap_or(&dir).join(if cfg!(windows) { "Kulisse" } else { "kulisse" }).join("config.toml")
+}
+
+/// Konfiguration speichern (kommentiert, siehe [`render`]). Erst in eine temporäre Datei, dann umbenennen –
+/// so liest die laufende App nie eine halb geschriebene Datei.
+pub fn save(path: &Path, cfg: &Config) -> Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, render(cfg)).with_context(|| format!("{tmp:?} schreiben"))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("{path:?} ersetzen"))?;
+    Ok(())
 }
 
 /// Einen Bool-Wert in der Datei ändern, ohne Kommentare und Formatierung zu verlieren
@@ -283,39 +341,112 @@ pub fn set_toml_bool(text: &str, section: &str, key: &str, value: bool) -> Strin
     s
 }
 
-/// Kommentierte Vorlage, die beim ersten Start angelegt wird.
-pub const DEFAULT_CONFIG: &str = r#"# Veyra – Konfiguration
-# Änderungen werden automatisch erkannt (oder Tray-Menü → "Konfiguration neu laden").
+impl GpuPreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GpuPreference::Low => "low",
+            GpuPreference::High => "high",
+        }
+    }
+}
 
-[general]
-autostart = false            # Mit Windows starten
-max_fps = 60                 # Obergrenze Bilder/s (30 spart nochmals Strom)
-pause_on_fullscreen = true   # Pause bei Spielen/Vollbild-Videos auf dem Monitor
-pause_on_maximized = false   # Pause, wenn ein maximiertes Fenster den Monitor verdeckt
-pause_on_battery = true      # Pause im Akkubetrieb / Energiesparmodus
-pause_on_lock = true         # Pause bei gesperrtem Bildschirm
-gpu = "low"                  # "low" = integrierte GPU (sparsam), "high" = dedizierte GPU
-backend = "auto"             # "auto" (= DX12 unter Windows), "dx12" oder "vulkan"
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Auto => "auto",
+            Backend::Dx12 => "dx12",
+            Backend::Vulkan => "vulkan",
+        }
+    }
+}
 
-[audio]
-enabled = true               # Audio-Reaktion global an/aus
-sensitivity = 1.0            # 0.1 – 5.0
-smoothing = 0.6              # 0.0 – 0.95
+impl Fit {
+    pub const ALL: [Fit; 3] = [Fit::Cover, Fit::Contain, Fit::Stretch];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Fit::Cover => "cover",
+            Fit::Contain => "contain",
+            Fit::Stretch => "stretch",
+        }
+    }
+}
 
-# Ein Block pro Wallpaper. monitor = "all", "primary" oder 1, 2, 3 … (von links nach rechts).
-# Ein spezifischer Eintrag (Nummer) hat Vorrang vor "primary", das wiederum vor "all".
-[[wallpaper]]
-monitor = "all"
-video = ''                   # z. B. 'C:\Users\Du\Videos\regen.mp4' (einfache Anführungszeichen!)
-fit = "cover"                # "cover", "contain" oder "stretch"
-effect = "none"              # "none", "pulse", "glow" oder "chroma" (audio-reaktiv)
-intensity = 1.0              # 0.0 – 3.0
+impl Effect {
+    pub const ALL: [Effect; 4] = [Effect::None, Effect::Pulse, Effect::Glow, Effect::Chroma];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::None => "none",
+            Effect::Pulse => "pulse",
+            Effect::Glow => "glow",
+            Effect::Chroma => "chroma",
+        }
+    }
+}
 
-# [[wallpaper]]
-# monitor = 2
-# video = 'D:\Wallpaper\stadt-nacht.mp4'
-# effect = "pulse"
-"#;
+/// Pfad als TOML-String: einfache Anführungszeichen (keine Backslash-Verdopplung), wenn möglich.
+fn toml_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if s.contains('\'') || s.contains('\n') {
+        toml::Value::String(s.into_owned()).to_string()
+    } else {
+        format!("'{s}'")
+    }
+}
+
+/// Konfiguration als kommentiertes TOML (Vorlage beim ersten Start, Speichern aus dem Einstellungsfenster).
+pub fn render(cfg: &Config) -> String {
+    let mut o = String::new();
+    let mut line = |kv: String, comment: &str| {
+        if comment.is_empty() {
+            o.push_str(&kv);
+        } else {
+            o.push_str(&format!("{kv:<28} # {comment}"));
+        }
+        o.push('\n');
+    };
+    let g = &cfg.general;
+    let a = &cfg.audio;
+    line("# Veyra – Konfiguration".into(), "");
+    line("# Änderungen werden automatisch übernommen. Bequemer: Tray-Menü → \"Einstellungen…\".".into(), "");
+    line(String::new(), "");
+    line("[general]".into(), "");
+    line(format!("autostart = {}", g.autostart), "Mit Windows starten");
+    line(format!("max_fps = {}", g.max_fps), "Obergrenze Bilder/s (30 spart nochmals Strom)");
+    line(format!("pause_on_fullscreen = {}", g.pause_on_fullscreen), "Pause bei Spielen/Vollbild-Videos auf dem Monitor");
+    line(format!("pause_on_maximized = {}", g.pause_on_maximized), "Pause, wenn ein maximiertes Fenster den Monitor verdeckt");
+    line(format!("pause_on_battery = {}", g.pause_on_battery), "Pause im Akkubetrieb / Energiesparmodus");
+    line(format!("pause_on_lock = {}", g.pause_on_lock), "Pause bei gesperrtem Bildschirm");
+    line(format!("pause_on_display_off = {}", g.pause_on_display_off), "Pause, wenn der Bildschirm aus ist");
+    line(format!("gpu = \"{}\"", g.gpu.as_str()), "\"low\" = integrierte GPU (sparsam), \"high\" = dedizierte GPU");
+    line(format!("backend = \"{}\"", g.backend.as_str()), "\"auto\" (= DX12 unter Windows), \"dx12\" oder \"vulkan\"");
+    line(String::new(), "");
+    line("[audio]".into(), "");
+    line(format!("enabled = {}", a.enabled), "Audio-Reaktion global an/aus");
+    line(format!("sensitivity = {:?}", a.sensitivity), "0.1 – 5.0");
+    line(format!("smoothing = {:?}", a.smoothing), "0.0 – 0.95");
+    line(String::new(), "");
+    line("[library]".into(), "");
+    line(format!("folder = {}", toml_path(&cfg.library.folder)), "Ordner mit Videos zur Auswahl (leer = \"Videos\")");
+    line(String::new(), "");
+    line("# Ein Block pro Wallpaper. monitor = \"all\", \"primary\" oder 1, 2, 3 … (von links nach rechts).".into(), "");
+    line("# Ein spezifischer Eintrag (Nummer) hat Vorrang vor \"primary\", das wiederum vor \"all\".".into(), "");
+    line("# video = '' lässt den Monitor beim normalen Windows-Hintergrund.".into(), "");
+    for w in &cfg.wallpapers {
+        let monitor = match &w.monitor {
+            MonitorSel::All => "\"all\"".to_string(),
+            MonitorSel::Primary => "\"primary\"".to_string(),
+            MonitorSel::Index(i) => i.to_string(),
+        };
+        line("[[wallpaper]]".into(), "");
+        line(format!("monitor = {monitor}"), "");
+        line(format!("video = {}", toml_path(&w.video)), "");
+        line(format!("fit = \"{}\"", w.fit.as_str()), "\"cover\", \"contain\" oder \"stretch\"");
+        line(format!("effect = \"{}\"", w.effect.as_str()), "\"none\", \"pulse\", \"glow\" oder \"chroma\" (audio-reaktiv)");
+        line(format!("intensity = {:?}", w.intensity), "0.0 – 3.0");
+        line(String::new(), "");
+    }
+    o
+}
 
 #[cfg(test)]
 mod tests {
@@ -323,7 +454,7 @@ mod tests {
 
     #[test]
     fn default_template_parses() {
-        let cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let cfg: Config = toml::from_str(&render(&Config::default())).unwrap();
         assert_eq!(cfg.wallpapers.len(), 1);
         assert_eq!(cfg.wallpapers[0].monitor, MonitorSel::All);
         assert_eq!(cfg.general.max_fps, 60);
@@ -357,8 +488,8 @@ mod tests {
 
     #[test]
     fn toggle_keeps_comments() {
-        let s = set_toml_bool(DEFAULT_CONFIG, "general", "autostart", true);
-        assert!(s.contains("autostart = true   # Mit Windows starten"));
+        let s = set_toml_bool(&render(&Config::default()), "general", "autostart", true);
+        assert!(s.contains("autostart = true") && s.contains("# Mit Windows starten"));
         let s = set_toml_bool(&s, "audio", "enabled", false);
         let cfg: Config = toml::from_str(&s).unwrap();
         assert!(cfg.general.autostart);
@@ -366,6 +497,35 @@ mod tests {
         // fehlende Sektion wird angelegt
         let s = set_toml_bool("", "audio", "enabled", true);
         assert!(toml::from_str::<Config>(&s).unwrap().audio.enabled);
+    }
+
+    #[test]
+    fn render_round_trip() {
+        let mut cfg = Config::default();
+        cfg.general.autostart = true;
+        cfg.audio.smoothing = 0.75;
+        cfg.library.folder = PathBuf::from(r"D:\Wall'paper");
+        cfg.wallpapers = vec![
+            Wallpaper { video: PathBuf::from(r"C:\Videos\a b.mp4"), ..Default::default() },
+            Wallpaper { monitor: MonitorSel::Index(2), video: PathBuf::new(), fit: Fit::Contain, effect: Effect::Glow, intensity: 2.5 },
+            Wallpaper { monitor: MonitorSel::Primary, ..Default::default() },
+        ];
+        let back: Config = toml::from_str(&render(&cfg)).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn legacy_config_without_new_keys_loads() {
+        let cfg: Config = toml::from_str("[general]\nautostart = true\n[[wallpaper]]\nvideo = 'a.mp4'\n").unwrap();
+        assert!(cfg.general.pause_on_display_off);
+        assert!(cfg.library.folder.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn video_extensions() {
+        assert!(is_video(Path::new("a.MP4")));
+        assert!(!is_video(Path::new("a.txt")));
+        assert!(!is_video(Path::new("mp4")));
     }
 
     #[test]

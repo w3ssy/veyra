@@ -13,10 +13,17 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows::Win32::System::Power::{
+    GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY, POWERBROADCAST_SETTING,
+    SYSTEM_POWER_STATUS,
+};
+use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, CreateWaitableTimerExW, OpenMutexW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    SYNCHRONIZATION_SYNCHRONIZE, TIMER_ALL_ACCESS,
+};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -28,6 +35,12 @@ const WTS_SESSION_LOCK: usize = 7;
 const WTS_SESSION_UNLOCK: usize = 8;
 const APP_NAME: PCWSTR = w!("Veyra");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+/// Kommandozeilen-Schalter, mit dem Windows Veyra beim Anmelden startet.
+pub const AUTOSTART_ARG: &str = "--autostart";
+/// Kommandozeilen-Schalter für das Einstellungsfenster.
+pub const SETTINGS_ARG: &str = "--settings";
+pub const SETTINGS_TITLE: &str = "Veyra – Einstellungen";
 
 /// Ereignisse aus den Fensterprozeduren an die App.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +52,8 @@ pub enum Event {
     DisplayChanged,
     /// Hell/Dunkel-Modus der Taskleiste geändert → Tray-Icon tauschen.
     ThemeChanged,
+    /// Bildschirm an (`true`) oder aus/gedimmt (`false`).
+    DisplayPower(bool),
     Locked(bool),
     Quit,
 }
@@ -67,8 +82,30 @@ pub fn init_process() {
 
 /// `None`, wenn Veyra bereits läuft. Das Handle muss bis Programmende gehalten werden.
 pub fn single_instance() -> Option<HANDLE> {
+    named_instance(w!("Local\\Veyra.SingleInstance"))
+}
+
+/// Wie [`single_instance`], aber für das Einstellungsfenster.
+pub fn settings_instance() -> Option<HANDLE> {
+    named_instance(w!("Local\\Veyra.Settings"))
+}
+
+/// Läuft der Hintergrund-Prozess (Wallpaper)?
+pub fn wallpaper_running() -> bool {
     unsafe {
-        let h = CreateMutexW(None, true, w!("Local\\Veyra.SingleInstance")).ok()?;
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\Veyra.SingleInstance")) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn named_instance(name: PCWSTR) -> Option<HANDLE> {
+    unsafe {
+        let h = CreateMutexW(None, true, name).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(h);
             return None;
@@ -81,6 +118,55 @@ pub fn error_box(text: &str) {
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), APP_NAME, MB_OK | MB_ICONERROR);
     }
+}
+
+/// Veyra (diese EXE) mit Argumenten als eigenen Prozess starten.
+pub fn spawn_self(args: &[&str]) {
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).spawn()) {
+        Ok(_) => {}
+        Err(e) => log::error!("Veyra {args:?} starten: {e}"),
+    }
+}
+
+/// Einstellungsfenster öffnen – oder ein bereits offenes nach vorne holen.
+pub fn open_settings() {
+    if !focus_settings() {
+        spawn_self(&[SETTINGS_ARG]);
+    }
+}
+
+/// Holt ein offenes Einstellungsfenster nach vorne. `false`, wenn keins offen ist.
+pub fn focus_settings() -> bool {
+    unsafe {
+        match FindWindowW(PCWSTR::null(), &HSTRING::from(SETTINGS_TITLE)) {
+            Ok(h) if !h.is_invalid() => {
+                if IsIconic(h).as_bool() {
+                    let _ = ShowWindow(h, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(h);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Beim Autostart: warten, bis Explorer Taskleiste und Desktop fertig aufgebaut hat (höchstens `max`).
+/// Ohne das hängt sich Veyra direkt nach der Anmeldung u. U. an eine Desktop-Ebene,
+/// die Explorer kurz darauf noch einmal umbaut.
+pub fn wait_for_shell(max: Duration) {
+    let start = std::time::Instant::now();
+    let ready = || unsafe {
+        FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).is_ok()
+            && FindWindowW(w!("Progman"), PCWSTR::null())
+                .is_ok_and(|p| FindWindowExW(Some(p), None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok() || find_legacy_workerw().is_some())
+    };
+    while !ready() && start.elapsed() < max {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Explorer räumt nach dem ersten Erscheinen noch kurz auf.
+    std::thread::sleep(Duration::from_secs(3));
+    log::info!("Desktop bereit nach {:.1} s", start.elapsed().as_secs_f32());
 }
 
 pub fn open_path(path: &Path) {
@@ -116,10 +202,34 @@ pub fn pump() -> bool {
     }
 }
 
+thread_local! {
+    /// Hochauflösender Timer (Windows 10 1803+). Der normale Windows-Takt ist 15,6 ms: Ein Schlaf von
+    /// 16 ms wird so oft zu 31 ms, und bei 60-fps-Videos fallen Bilder aus – außer, irgendein anderes
+    /// Programm (Browser, VS Code …) hat den Takt gerade systemweit verfeinert.
+    static TIMER: Option<HANDLE> = unsafe {
+        CreateWaitableTimerExW(None, PCWSTR::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0).ok()
+    };
+}
+
 /// Schlafen, bis die Zeit um ist oder eine Nachricht eintrifft (0 % CPU im Leerlauf).
+/// Genau auf ~1 ms, ohne den Takt des ganzen Systems zu verändern (`timeBeginPeriod` wäre schlechter für den Akku).
 pub fn wait(timeout: Duration) {
     unsafe {
-        MsgWaitForMultipleObjectsEx(None, timeout.as_millis().min(u32::MAX as u128) as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        let precise = TIMER.with(|t| {
+            let t = (*t)?;
+            // Negativ = relativ, in 100-ns-Einheiten.
+            let due = -(timeout.as_nanos().min(i64::MAX as u128 / 2) as i64 / 100).max(1);
+            SetWaitableTimer(t, &due, 0, None, None, false).ok()?;
+            Some(t)
+        });
+        match precise {
+            Some(t) => {
+                MsgWaitForMultipleObjectsEx(Some(&[t]), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
+            None => {
+                MsgWaitForMultipleObjectsEx(None, timeout.as_millis().min(u32::MAX as u128) as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
+        }
     }
 }
 
@@ -202,6 +312,57 @@ impl DesktopHost {
                 }
             }
             bail!("Desktop-Ebene hinter den Symbolen nicht gefunden")
+        }
+    }
+}
+
+/// Ergebnis der regelmäßigen Prüfung der Desktop-Einbettung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostState {
+    Ok,
+    /// Explorer hat die Reihenfolge geändert, unsere Fenster wurden wieder unter die Symbole sortiert.
+    Reordered,
+    /// Elternfenster/Symbole weg oder ersetzt → alles neu aufbauen.
+    Broken,
+}
+
+impl DesktopHost {
+    /// Prüft, ob unsere Fenster noch richtig eingebettet sind (billig, alle 0,5 s).
+    pub fn check(&self, windows: &[isize]) -> HostState {
+        unsafe {
+            if !IsWindow(Some(self.parent)).as_bool() {
+                return HostState::Broken;
+            }
+            let ours: Vec<HWND> = windows.iter().map(|&h| HWND(h as *mut _)).collect();
+            if ours.iter().any(|&h| !IsWindow(Some(h)).as_bool() || GetParent(h).ok() != Some(self.parent)) {
+                return HostState::Broken;
+            }
+            let Some(icons) = self.icons else { return HostState::Ok };
+            // Raised desktop: Symbole müssen noch dieselben sein …
+            if FindWindowExW(Some(self.parent), None, w!("SHELLDLL_DefView"), PCWSTR::null()).ok() != Some(icons) {
+                return HostState::Broken;
+            }
+            // … und zwischen Symbolen und unseren Fenstern darf kein WorkerW (statisches Hintergrundbild) liegen.
+            let mut reordered = false;
+            for &h in &ours {
+                let mut cur = GetWindow(icons, GW_HWNDNEXT).ok();
+                while let Some(c) = cur {
+                    if c == h {
+                        break;
+                    }
+                    if class_name(c) == "WorkerW" {
+                        let _ = SetWindowPos(h, Some(icons), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        reordered = true;
+                        break;
+                    }
+                    cur = GetWindow(c, GW_HWNDNEXT).ok();
+                }
+            }
+            if reordered {
+                HostState::Reordered
+            } else {
+                HostState::Ok
+            }
         }
     }
 }
@@ -323,6 +484,7 @@ unsafe extern "system" fn wallpaper_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
 /// Unsichtbares Top-Level-Fenster: empfängt Tray-, Anzeige- und Sperr-Nachrichten.
 pub struct ControlWindow {
     hwnd: HWND,
+    power: Option<HPOWERNOTIFY>,
 }
 
 impl ControlWindow {
@@ -346,8 +508,14 @@ impl ControlWindow {
                 None,
             )?;
             let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-            Ok(Self { hwnd })
+            // Bildschirm an/aus (meldet den aktuellen Zustand sofort einmal).
+            let power = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE).ok();
+            Ok(Self { hwnd, power })
         }
+    }
+
+    pub fn id(&self) -> isize {
+        self.hwnd.0 as isize
     }
 }
 
@@ -355,6 +523,9 @@ impl Drop for ControlWindow {
     fn drop(&mut self) {
         unsafe {
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
+            if let Some(p) = self.power.take() {
+                let _ = UnregisterPowerSettingNotification(p);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -377,6 +548,14 @@ unsafe extern "system" fn control_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_DISPLAYCHANGE => {
             push(Event::DisplayChanged);
             LRESULT(0)
+        }
+        WM_POWERBROADCAST if wp.0 == PBT_POWERSETTINGCHANGE && lp.0 != 0 => {
+            let setting = &*(lp.0 as *const POWERBROADCAST_SETTING);
+            if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting.DataLength >= 1 {
+                // 0 = aus, 1 = an, 2 = gedimmt
+                push(Event::DisplayPower(setting.Data[0] == 1));
+            }
+            LRESULT(1)
         }
         WM_SETTINGCHANGE => {
             let area = PCWSTR(lp.0 as *const u16);
@@ -540,8 +719,7 @@ pub fn set_autostart(on: bool) -> Result<()> {
         let mut key = HKEY::default();
         RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, KEY_SET_VALUE, &mut key).ok()?;
         let r = if on {
-            let exe = std::env::current_exe()?;
-            let value: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain([0]).collect();
+            let value: Vec<u16> = autostart_command()?.encode_utf16().chain([0]).collect();
             let bytes = std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2);
             RegSetValueExW(key, APP_NAME, None, REG_SZ, Some(bytes)).ok()
         } else {
@@ -555,8 +733,68 @@ pub fn set_autostart(on: bool) -> Result<()> {
     }
 }
 
+fn autostart_command() -> Result<String> {
+    Ok(format!("\"{}\" {AUTOSTART_ARG}", std::env::current_exe()?.display()))
+}
+
+/// Aktueller Registry-Eintrag (falls vorhanden).
+fn autostart_value() -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, APP_NAME, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr().cast()), Some(&mut len)).ok().ok()?;
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
 pub fn autostart_enabled() -> bool {
-    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, APP_NAME, RRF_RT_REG_SZ, None, None, None).is_ok() }
+    autostart_value().is_some()
+}
+
+/// Eintrag vorhanden und zeigt auf diese EXE mit dem Autostart-Schalter (sonst neu schreiben,
+/// z. B. nach dem Verschieben der EXE oder von älteren Versionen ohne Schalter).
+pub fn autostart_current() -> bool {
+    autostart_value().is_some_and(|v| autostart_command().is_ok_and(|c| v.eq_ignore_ascii_case(&c)))
+}
+
+// ───────────────────────────── Dateidialoge (Einstellungsfenster) ─────────────────────────────
+
+/// Windows-Dialog „Öffnen“ für Videos bzw. (bei `folder`) für einen Ordner. `None` = abgebrochen.
+pub fn pick_path(folder: bool, start: Option<&Path>) -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        if folder {
+            let _ = dlg.SetOptions(dlg.GetOptions().unwrap_or_default() | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+            let _ = dlg.SetTitle(w!("Ordner für die Video-Bibliothek wählen"));
+        } else {
+            let pattern = crate::config::VIDEO_EXTENSIONS.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";");
+            let (name, spec) = (HSTRING::from("Videos"), HSTRING::from(pattern));
+            let (all_name, all_spec) = (HSTRING::from("Alle Dateien"), HSTRING::from("*.*"));
+            let filters = [
+                COMDLG_FILTERSPEC { pszName: PCWSTR(name.as_ptr()), pszSpec: PCWSTR(spec.as_ptr()) },
+                COMDLG_FILTERSPEC { pszName: PCWSTR(all_name.as_ptr()), pszSpec: PCWSTR(all_spec.as_ptr()) },
+            ];
+            let _ = dlg.SetFileTypes(&filters);
+            let _ = dlg.SetOptions(dlg.GetOptions().unwrap_or_default() | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+            let _ = dlg.SetTitle(w!("Video wählen"));
+        }
+        if let Some(dir) = start.filter(|d| d.is_dir()) {
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
+                let _ = dlg.SetFolder(&item);
+            }
+        }
+        let owner = GetForegroundWindow();
+        dlg.Show(Some(owner)).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = path.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
+        s.map(std::path::PathBuf::from)
+    }
 }
 
 // ───────────────────────────── Pause-Erkennung ─────────────────────────────

@@ -1,0 +1,37 @@
+name: Release
+
+# Ein Tag wie "v0.2.0" pushen → fertige veyra.exe als GitHub-Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version prüfen
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} passt nicht zu Cargo.toml ($version)" }
+      - name: Tests
+        run: cargo test --release
+      - name: Bauen
+        run: cargo build --release
+      - name: Prüfsumme
+        shell: pwsh
+        run: |
+          Copy-Item target/release/veyra.exe veyra.exe
+          (Get-FileHash veyra.exe -Algorithm SHA256).Hash.ToLower() + "  veyra.exe" | Out-File -Encoding ascii veyra.exe.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            veyra.exe
+            veyra.exe.sha256
+          generate_release_notes: true

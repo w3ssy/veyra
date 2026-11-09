@@ -3,9 +3,9 @@
 
 use crate::audio::{AudioCapture, Levels, SharedLevels};
 use crate::config::{self, Config, Effect, Wallpaper};
-use crate::platform::sys::{self, DesktopHost, Event, MenuItem, Monitor, Tray, WallpaperWindow};
+use crate::platform::sys::{self, DesktopHost, Event, HostState, MenuItem, Monitor, Tray, WallpaperWindow};
 use crate::render::{DrawParams, Gpu, Target, VideoTex};
-use crate::video::Player;
+use crate::video::{DecodeOptions, Player};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,9 +13,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 const IDLE_WAKE: Duration = Duration::from_millis(500);
 const SYSTEM_CHECK: Duration = Duration::from_millis(500);
-const CONFIG_CHECK: Duration = Duration::from_secs(2);
+const CONFIG_CHECK: Duration = Duration::from_secs(1);
 
 mod menu {
+    pub const SETTINGS: u32 = 10;
     pub const PAUSE: u32 = 1;
     pub const AUDIO: u32 = 2;
     pub const OPEN_CONFIG: u32 = 3;
@@ -38,6 +39,7 @@ struct Slot {
 
 struct PlayerEntry {
     player: Player,
+    opts: DecodeOptions,
     tex: Option<VideoTex>,
     fresh: bool,
 }
@@ -50,6 +52,8 @@ pub struct App {
     // Reihenfolge: Slots (Fenster) vor Tray/Steuerfenster abbauen.
     slots: Vec<Slot>,
     players: HashMap<PathBuf, PlayerEntry>,
+    /// Desktop-Ebene, in die die aktuellen Fenster eingebettet sind (für den Wächter).
+    host: Option<DesktopHost>,
     tray: Tray,
     // Muss leben, solange die App läuft (empfängt Tray- und Systemnachrichten).
     _control: sys::ControlWindow,
@@ -58,6 +62,7 @@ pub struct App {
     audio: Option<AudioCapture>,
     manual_pause: bool,
     locked: bool,
+    display_off: bool,
     sys_state: sys::SystemState,
     start: Instant,
     last_tick: Instant,
@@ -67,12 +72,15 @@ pub struct App {
     quit: bool,
 }
 
-pub fn run() -> Result<()> {
+pub fn run(autostart: bool) -> Result<()> {
     sys::init_process();
     let Some(_instance) = sys::single_instance() else {
         log::info!("Veyra läuft bereits.");
         return Ok(());
     };
+    if autostart {
+        sys::wait_for_shell(Duration::from_secs(60));
+    }
 
     let cfg_path = config::config_path();
     let cfg = Config::load_or_create(&cfg_path)?;
@@ -88,6 +96,7 @@ pub fn run() -> Result<()> {
         gpu,
         slots: Vec::new(),
         players: HashMap::new(),
+        host: None,
         tray,
         _control: control,
         monitors: Vec::new(),
@@ -95,6 +104,7 @@ pub fn run() -> Result<()> {
         audio: None,
         manual_pause: false,
         locked: false,
+        display_off: false,
         sys_state: Default::default(),
         start: now,
         last_tick: now,
@@ -140,6 +150,11 @@ impl App {
             }
             Event::DisplayChanged => self.schedule_rebuild(Duration::from_millis(800)),
             Event::ThemeChanged => self.tray.refresh_icon(),
+            Event::DisplayPower(on) => {
+                log::debug!("Bildschirm {}", if on { "an" } else { "aus" });
+                self.display_off = !on;
+                self.last_sys_check = Instant::now() - SYSTEM_CHECK; // sofort neu bewerten
+            }
             Event::Locked(l) => self.locked = l,
             Event::Quit => self.quit = true,
         }
@@ -152,21 +167,31 @@ impl App {
     /// Fenster, Oberflächen, Dekoder und Audio passend zu Konfiguration und Monitoren (neu) anlegen.
     fn rebuild(&mut self) {
         self.slots.clear();
+        self.host = None;
         self.monitors = sys::monitors();
         for (i, m) in self.monitors.iter().enumerate() {
             log::info!("Monitor {}: {} {}x{} @ {},{}{}", i + 1, m.name, m.width, m.height, m.x, m.y, if m.primary { " (primär)" } else { "" });
         }
 
-        let primary: Vec<bool> = self.monitors.iter().map(|m| m.primary).collect();
-        let wanted: Vec<(usize, Wallpaper)> =
-            self.cfg.assign(&primary).into_iter().enumerate().filter_map(|(i, w)| w.map(|w| (i, w.clone()))).collect();
+        let wanted = self.wanted();
 
-        // Dekoder nur für tatsächlich genutzte Dateien behalten bzw. starten.
-        self.players.retain(|p, _| wanted.iter().any(|(_, w)| &w.video == p));
-        for (_, w) in &wanted {
+        // Dekoder pro Datei: Zielgröße = größter Monitor, der sie zeigt.
+        let mut wanted_opts: HashMap<PathBuf, DecodeOptions> = HashMap::new();
+        for (i, w) in &wanted {
+            let m = &self.monitors[*i];
+            let o = wanted_opts.entry(w.video.clone()).or_insert(DecodeOptions {
+                max_size: Some((0, 0)),
+                low_power: self.cfg.general.gpu == crate::config::GpuPreference::Low,
+            });
+            let (mw, mh) = o.max_size.unwrap_or_default();
+            o.max_size = Some((mw.max(m.width as u32), mh.max(m.height as u32)));
+        }
+        // Nur Dekoder behalten, deren Datei und Zielgröße gleich geblieben sind.
+        self.players.retain(|p, e| wanted_opts.get(p) == Some(&e.opts));
+        for (path, opts) in wanted_opts {
             self.players
-                .entry(w.video.clone())
-                .or_insert_with(|| PlayerEntry { player: Player::open(&w.video), tex: None, fresh: false });
+                .entry(path.clone())
+                .or_insert_with(|| PlayerEntry { player: Player::open(&path, opts), opts, tex: None, fresh: false });
         }
 
         if !wanted.is_empty() {
@@ -178,6 +203,7 @@ impl App {
                             Err(e) => log::error!("Monitor {}: {e:?}", i + 1),
                         }
                     }
+                    self.host = Some(host);
                 }
                 Err(e) => {
                     // Passiert z. B. beim Autostart, wenn Explorer noch nicht fertig ist.
@@ -187,14 +213,24 @@ impl App {
             }
         }
 
-        // Audio nur mitschneiden, wenn es auch genutzt wird.
-        let need_audio = self.cfg.needs_audio();
-        if need_audio && self.audio.is_none() {
+        self.update_audio();
+        self.update_tooltip();
+    }
+
+    /// Welcher Monitor zeigt welchen Wallpaper-Eintrag (nur Monitore mit Video).
+    fn wanted(&self) -> Vec<(usize, Wallpaper)> {
+        let primary: Vec<bool> = self.monitors.iter().map(|m| m.primary).collect();
+        self.cfg.assign(&primary).into_iter().enumerate().filter_map(|(i, w)| w.map(|w| (i, w.clone()))).collect()
+    }
+
+    /// Audio nur mitschneiden, wenn ein sichtbarer Monitor einen Effekt nutzt.
+    fn update_audio(&mut self) {
+        let needed = self.cfg.needs_audio() && self.slots.iter().any(|s| !s.paused && s.wallpaper.effect != Effect::None);
+        if needed && self.audio.is_none() {
             self.audio = Some(AudioCapture::start(self.levels.clone(), self.cfg.audio.sensitivity, self.cfg.audio.smoothing));
-        } else if !need_audio {
+        } else if !needed && self.audio.is_some() {
             self.audio = None;
         }
-        self.update_tooltip();
     }
 
     fn create_slot(&mut self, host: &DesktopHost, monitor_index: usize, wallpaper: Wallpaper) -> Result<Slot> {
@@ -208,18 +244,35 @@ impl App {
     fn reload_config(&mut self) {
         match Config::load_or_create(&self.cfg_path) {
             Ok(cfg) => {
-                let gpu_changed = cfg.general.gpu != self.cfg.general.gpu || cfg.general.backend != self.cfg.general.backend;
-                let audio_changed = cfg.audio != self.cfg.audio;
-                self.cfg = cfg;
-                if gpu_changed {
+                if cfg == self.cfg {
+                    return;
+                }
+                let old = std::mem::replace(&mut self.cfg, cfg);
+                if old.general.gpu != self.cfg.general.gpu || old.general.backend != self.cfg.general.backend {
                     log::warn!("GPU-/Backend-Änderung wird erst nach einem Neustart von Veyra wirksam");
                 }
-                if audio_changed {
+                if old.audio != self.cfg.audio {
                     self.audio = None; // mit neuen Parametern neu starten
                 }
                 self.apply_autostart();
-                log::info!("Konfiguration neu geladen");
-                self.rebuild();
+                // Fenster nur neu anlegen, wenn sich ändert, welcher Monitor welches Video zeigt.
+                // Darstellung, Effekte, Pausen-Regeln, Autostart … werden direkt übernommen.
+                let wanted = self.wanted();
+                let same_layout = wanted.len() == self.slots.len()
+                    && wanted.iter().zip(&self.slots).all(|((i, w), s)| *i == s.monitor_index && w.video == s.wallpaper.video);
+                if same_layout {
+                    for ((_, w), slot) in wanted.into_iter().zip(&mut self.slots) {
+                        slot.wallpaper = w;
+                        slot.dirty = true;
+                    }
+                    self.last_sys_check = Instant::now() - SYSTEM_CHECK;
+                    self.update_audio();
+                    self.update_tooltip();
+                    log::info!("Konfiguration übernommen");
+                } else {
+                    log::info!("Konfiguration neu geladen – Wallpaper werden neu aufgebaut");
+                    self.rebuild();
+                }
             }
             Err(e) => {
                 log::error!("Konfiguration fehlerhaft, behalte die alte: {e:?}");
@@ -229,9 +282,12 @@ impl App {
     }
 
     fn apply_autostart(&self) {
-        if self.cfg.general.autostart != sys::autostart_enabled() {
-            if let Err(e) = sys::set_autostart(self.cfg.general.autostart) {
-                log::error!("{e:?}");
+        let want = self.cfg.general.autostart;
+        let needs_write = if want { !sys::autostart_current() } else { sys::autostart_enabled() };
+        if needs_write {
+            match sys::set_autostart(want) {
+                Ok(()) => log::info!("Autostart {}", if want { "eingerichtet" } else { "entfernt" }),
+                Err(e) => log::error!("{e:?}"),
             }
         }
     }
@@ -268,10 +324,12 @@ impl App {
     fn show_menu(&mut self) {
         let pause_label = if self.manual_pause { "Fortsetzen" } else { "Pausieren" };
         let id = self.tray.show_menu(&[
+            MenuItem::Item { id: menu::SETTINGS, label: "Einstellungen…", checked: false },
+            MenuItem::Separator,
             MenuItem::Item { id: menu::PAUSE, label: pause_label, checked: false },
             MenuItem::Item { id: menu::AUDIO, label: "Audio-reaktiv", checked: self.cfg.audio.enabled },
             MenuItem::Separator,
-            MenuItem::Item { id: menu::OPEN_CONFIG, label: "Konfiguration bearbeiten…", checked: false },
+            MenuItem::Item { id: menu::OPEN_CONFIG, label: "config.toml bearbeiten…", checked: false },
             MenuItem::Item { id: menu::RELOAD, label: "Konfiguration neu laden", checked: false },
             MenuItem::Item { id: menu::OPEN_FOLDER, label: "Ordner mit Log öffnen", checked: false },
             MenuItem::Separator,
@@ -280,6 +338,7 @@ impl App {
             MenuItem::Item { id: menu::QUIT, label: "Beenden", checked: false },
         ]);
         match id {
+            menu::SETTINGS => sys::open_settings(),
             menu::PAUSE => self.toggle_pause(),
             menu::AUDIO => self.write_toggle("audio", "enabled", !self.cfg.audio.enabled),
             menu::OPEN_CONFIG => sys::open_path(&self.cfg_path),
@@ -311,10 +370,12 @@ impl App {
         }
         if now - self.last_sys_check >= SYSTEM_CHECK {
             self.last_sys_check = now;
+            self.check_desktop();
             self.update_pause_state();
         }
 
         // Videos weiterlaufen lassen, deren Monitor sichtbar ist.
+        let mut next_frame: Option<Duration> = None;
         for (path, entry) in self.players.iter_mut() {
             entry.fresh = false;
             let active = self.slots.iter().any(|s| !s.paused && &s.wallpaper.video == path);
@@ -326,6 +387,9 @@ impl App {
                 self.gpu.upload(&mut entry.tex, &frame);
                 entry.player.recycle(frame);
                 entry.fresh = true;
+            }
+            if let Some(d) = entry.player.next_due() {
+                next_frame = Some(next_frame.map_or(d, |n| n.min(d)));
             }
         }
 
@@ -346,7 +410,9 @@ impl App {
             // Bei Stille nicht neu zeichnen – sonst liefe die GPU umsonst mit max_fps.
             let audible = levels.bass + levels.mid + levels.high + levels.level > 0.004;
             let animated = audio_on && audible && slot.wallpaper.effect != Effect::None;
-            if (slot.dirty || animated) && now - slot.last_render >= interval.mul_f32(0.9) {
+            // Großzügige Toleranz: Bilder kommen nie exakt im Takt. Mit 0,9 fiel bei 60-fps-Videos und
+            // max_fps = 60 jedes leicht verfrühte Bild weg; mit 0,75 wird max_fps trotzdem eingehalten.
+            if (slot.dirty || animated) && now - slot.last_render >= interval.mul_f32(0.75) {
                 let params = DrawParams {
                     fit: slot.wallpaper.fit,
                     effect: if audio_on { slot.wallpaper.effect } else { Effect::None },
@@ -361,19 +427,45 @@ impl App {
         }
 
         if anything_active {
-            interval.min(Duration::from_millis(16))
+            // Genau zum nächsten fälligen Bild aufwachen (höchstens `interval`, für Audio-Effekte);
+            // liefert der Dekoder gerade nichts, kurz darauf erneut nachsehen.
+            next_frame.unwrap_or(Duration::from_millis(4)).clamp(Duration::from_millis(1), interval)
         } else {
             IDLE_WAKE
         }
     }
 
+    /// Wächter: Explorer baut die Desktop-Ebene gelegentlich um (v. a. kurz nach der Anmeldung).
+    fn check_desktop(&mut self) {
+        let Some(host) = &self.host else { return };
+        if self.rebuild_at.is_some() || self.slots.is_empty() {
+            return;
+        }
+        let ids: Vec<isize> = self.slots.iter().map(|s| s.window.id()).collect();
+        match host.check(&ids) {
+            HostState::Ok => {}
+            HostState::Reordered => {
+                log::warn!("Desktop-Reihenfolge verändert – Wallpaper wieder unter die Symbole sortiert");
+                for s in &mut self.slots {
+                    s.dirty = true;
+                }
+            }
+            HostState::Broken => {
+                log::warn!("Desktop-Einbettung verloren – baue Wallpaper neu auf");
+                self.schedule_rebuild(Duration::from_millis(500));
+            }
+        }
+    }
+
     fn update_pause_state(&mut self) {
-        let own: Vec<isize> = self.slots.iter().map(|s| s.window.id()).collect();
+        let mut own: Vec<isize> = self.slots.iter().map(|s| s.window.id()).collect();
+        own.push(self._control.id());
         self.sys_state = sys::system_state(&self.monitors, &own);
         let g = &self.cfg.general;
         let st = &self.sys_state;
         let global = self.manual_pause
             || (g.pause_on_lock && self.locked)
+            || (g.pause_on_display_off && self.display_off)
             || (g.pause_on_battery && st.on_battery)
             || (g.pause_on_fullscreen && st.exclusive_fullscreen);
 
@@ -388,12 +480,6 @@ impl App {
             }
         }
 
-        // Audio-Mitschnitt anhalten, wenn kein sichtbarer Monitor einen Effekt nutzt.
-        let audio_needed = self.cfg.needs_audio() && self.slots.iter().any(|s| !s.paused && s.wallpaper.effect != Effect::None);
-        if audio_needed && self.audio.is_none() {
-            self.audio = Some(AudioCapture::start(self.levels.clone(), self.cfg.audio.sensitivity, self.cfg.audio.smoothing));
-        } else if !audio_needed && self.audio.is_some() {
-            self.audio = None;
-        }
+        self.update_audio();
     }
 }

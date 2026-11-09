@@ -9,6 +9,10 @@ use std::time::Duration;
 #[cfg(windows)]
 mod mf;
 
+/// Vorschaubild als RGBA (Breite, Höhe, Pixel) – für das Einstellungsfenster.
+#[cfg(windows)]
+pub use mf::thumbnail;
+
 /// Ein dekodiertes Bild im NV12-Format (Y-Ebene, danach verschachtelte UV-Ebene).
 /// NV12 ist das native Ausgabeformat der Hardware-Dekoder und halb so groß wie RGBA.
 pub struct Frame {
@@ -34,6 +38,28 @@ impl Frame {
     }
 }
 
+/// Wie dekodiert werden soll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeOptions {
+    /// Größter Monitor, der das Video zeigt (Breite, Höhe). Größere Videos verkleinert die GPU
+    /// schon beim Dekodieren darauf – 4K auf einem 1080p-Monitor = ¼ der Daten.
+    pub max_size: Option<(u32, u32)>,
+    /// Sparsame (integrierte) statt leistungsstarker GPU – dieselbe Wahl wie beim Zeichnen.
+    pub low_power: bool,
+}
+
+/// Ausgabegröße: so weit verkleinern, dass das Video den Monitor gerade noch füllt (wie `fit = "cover"`),
+/// nie vergrößern. Gerade Werte, weil NV12 Farbinformation pro 2×2 Pixel speichert.
+pub fn scaled_size(video: (u32, u32), monitor: (u32, u32)) -> Option<(u32, u32)> {
+    let (vw, vh) = (video.0 as f64, video.1 as f64);
+    let s = (monitor.0 as f64 / vw).max(monitor.1 as f64 / vh);
+    if s >= 0.95 {
+        return None; // lohnt sich nicht
+    }
+    let even = |x: f64| ((x.ceil() as u32).div_ceil(2) * 2).max(2);
+    Some((even(vw * s), even(vh * s)))
+}
+
 /// Wie viele Bilder der Dekoder vorausarbeiten darf. Klein halten = wenig RAM/VRAM.
 const QUEUE: usize = 3;
 
@@ -49,11 +75,11 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn open(path: &Path) -> Self {
+    pub fn open(path: &Path, opts: DecodeOptions) -> Self {
         let (tx, rx) = sync_channel(QUEUE);
         let (pool_tx, pool_rx) = sync_channel(QUEUE + 2);
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_decoder(path.to_path_buf(), tx, pool_rx, stop.clone());
+        spawn_decoder(path.to_path_buf(), opts, tx, pool_rx, stop.clone());
         Self { path: path.to_path_buf(), rx, pool: pool_tx, stop, pending: None, position: Duration::ZERO, started: false, failed: false }
     }
 
@@ -62,6 +88,15 @@ impl Player {
         if self.started {
             self.position += dt.min(Duration::from_millis(100));
         }
+    }
+
+    /// Wie lange, bis das nächste Bild fällig ist (`None`, wenn der Dekoder noch keins geliefert hat).
+    pub fn next_due(&mut self) -> Option<Duration> {
+        if self.pending.is_none() {
+            self.pending = self.rx.try_recv().ok();
+        }
+        let f = self.pending.as_ref()?;
+        Some(if self.started { f.pts.saturating_sub(self.position) } else { Duration::ZERO })
     }
 
     /// Das neueste fällige Bild holen (ältere fällige werden übersprungen und recycelt).
@@ -110,11 +145,11 @@ impl Drop for Player {
 }
 
 #[cfg(windows)]
-fn spawn_decoder(path: PathBuf, tx: SyncSender<Frame>, pool: Receiver<Vec<u8>>, stop: Arc<AtomicBool>) {
+fn spawn_decoder(path: PathBuf, opts: DecodeOptions, tx: SyncSender<Frame>, pool: Receiver<Vec<u8>>, stop: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("video-decoder".into())
         .spawn(move || {
-            if let Err(e) = mf::decode_loop(&path, &tx, &pool, &stop) {
+            if let Err(e) = mf::decode_loop(&path, opts, &tx, &pool, &stop) {
                 log::error!("Video {path:?}: {e:?}");
             }
         })
@@ -122,7 +157,7 @@ fn spawn_decoder(path: PathBuf, tx: SyncSender<Frame>, pool: Receiver<Vec<u8>>, 
 }
 
 #[cfg(not(windows))]
-fn spawn_decoder(path: PathBuf, _tx: SyncSender<Frame>, _pool: Receiver<Vec<u8>>, _stop: Arc<AtomicBool>) {
+fn spawn_decoder(path: PathBuf, _opts: DecodeOptions, _tx: SyncSender<Frame>, _pool: Receiver<Vec<u8>>, _stop: Arc<AtomicBool>) {
     // Linux-Backend (GStreamer/VA-API) folgt – siehe docs/ARCHITEKTUR.md.
     log::error!("Kein Video-Backend für diese Plattform: {path:?}");
 }
@@ -133,6 +168,32 @@ mod tests {
 
     fn frame(ms: u64) -> Frame {
         Frame { data: vec![], pitch: 4, width: 4, height: 2, y_rows: 2, crop: [0.0, 0.0, 1.0, 1.0], pts: Duration::from_millis(ms), bt709: true }
+    }
+
+    #[test]
+    fn next_due_reports_time_to_next_frame() {
+        let (tx, rx) = sync_channel(8);
+        let (pool, _pool_rx) = sync_channel(8);
+        let mut p = Player { path: "x".into(), rx, pool, stop: Default::default(), pending: None, position: Duration::ZERO, started: false, failed: false };
+        assert_eq!(p.next_due(), None);
+        tx.send(frame(1000)).unwrap();
+        tx.send(frame(1016)).unwrap();
+        assert_eq!(p.next_due(), Some(Duration::ZERO));
+        p.take_due().unwrap();
+        assert_eq!(p.next_due(), Some(Duration::from_millis(16)));
+        p.advance(Duration::from_millis(10));
+        assert_eq!(p.next_due(), Some(Duration::from_millis(6)));
+    }
+
+    #[test]
+    fn downscale_to_monitor() {
+        // 4K auf 1080p: exakt ein Viertel.
+        assert_eq!(scaled_size((3840, 2160), (1920, 1080)), Some((1920, 1080)));
+        // Anderes Seitenverhältnis: so groß, dass der Monitor gefüllt wird.
+        assert_eq!(scaled_size((3840, 1600), (1920, 1080)), Some((2592, 1080)));
+        // Kleiner oder gleich groß: nichts tun.
+        assert_eq!(scaled_size((1920, 1080), (1920, 1080)), None);
+        assert_eq!(scaled_size((1280, 720), (2560, 1440)), None);
     }
 
     #[test]

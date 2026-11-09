@@ -23,6 +23,9 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 - 🖥️ **Multi-Monitor** – pro Bildschirm ein eigenes Video oder ein Video für alle (wird dann nur einmal dekodiert)
 - ⏸️ **Auto-Pause** bei Vollbild-Spielen/-Videos, maximierten Fenstern (optional), Akkubetrieb und Sperrbildschirm
 - 🔊 **Audio-reaktiv** – Effekte `pulse`, `glow` und `chroma` reagieren auf den Systemsound (WASAPI-Loopback)
+- 🖼️ **Einstellungsfenster** – Monitore in echter Anordnung mit Vorschau, Video per Klick, Dateidialog oder Drag & Drop
+- 📚 **Video-Bibliothek** – ein Ordner (Standard: „Videos“), dessen Videos mit Vorschaubild zur Auswahl stehen
+- ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
@@ -40,8 +43,13 @@ Videos effizient als Hintergrund abspielen.
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
 | Netzwerk | Kein einziger Netzwerkaufruf im Code |
-| Codebasis | ~2.500 Zeilen Rust, 8 direkte Abhängigkeiten |
+| Codebasis | ~3.800 Zeilen Rust, 9 direkte Abhängigkeiten |
 | Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist – und pausiert, wenn niemand hinsieht |
+
+## Download
+
+Fertige Builds gibt es unter [Releases](https://github.com/w3ssy/veyra/releases) – einfach `veyra.exe` herunterladen
+und starten (keine Installation, keine Adminrechte). Die `.sha256`-Datei daneben enthält die Prüfsumme.
 
 ## Bauen (Windows)
 
@@ -66,8 +74,15 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
 ## Benutzen
 
 1. `veyra.exe` starten – es erscheint ein Symbol im Infobereich der Taskleiste.
-2. Rechtsklick → **Konfiguration bearbeiten…** öffnet `%APPDATA%\Veyra\config.toml`.
-3. Bei `video = '…'` den Pfad zu deinem Video eintragen und speichern – die Änderung wird nach ~2 s automatisch übernommen.
+2. Rechtsklick → **Einstellungen…** öffnet das Einstellungsfenster:
+   - oben deine Monitore in ihrer echten Anordnung, mit Vorschau des jeweiligen Videos,
+   - „Ein Video für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video zu geben,
+   - Video per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
+   - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
+3. **Speichern** (oder Strg+S) – Veyra übernimmt die Änderung sofort.
+
+Wer lieber eine Textdatei bearbeitet: Tray → **config.toml bearbeiten…** öffnet `%APPDATA%\Veyra\config.toml`;
+Änderungen werden nach ~1 s automatisch übernommen.
 
 ```toml
 [[wallpaper]]
@@ -76,6 +91,9 @@ video = 'C:\Users\<name>\Videos\regen.mp4'
 fit = "cover"
 effect = "pulse"
 intensity = 1.0
+
+[library]
+folder = 'D:\Wallpaper'  # Ordner für die Bibliothek im Einstellungsfenster (leer = "Videos")
 
 [[wallpaper]]            # Monitor 2 bekommt ein eigenes Video
 monitor = 2
