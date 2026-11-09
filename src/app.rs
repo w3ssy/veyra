@@ -63,6 +63,8 @@ pub struct App {
     manual_pause: bool,
     locked: bool,
     display_off: bool,
+    /// Zero-Copy erlaubt (wird nach einem Fehler dauerhaft abgeschaltet → Weg über den Arbeitsspeicher).
+    zero_copy: bool,
     sys_state: sys::SystemState,
     start: Instant,
     last_tick: Instant,
@@ -105,6 +107,7 @@ pub fn run(autostart: bool) -> Result<()> {
         manual_pause: false,
         locked: false,
         display_off: false,
+        zero_copy: true,
         sys_state: Default::default(),
         start: now,
         last_tick: now,
@@ -175,29 +178,10 @@ impl App {
 
         let wanted = self.wanted();
 
-        // Dekoder pro Datei: Zielgröße = größter Monitor, der sie zeigt.
-        let mut wanted_opts: HashMap<PathBuf, DecodeOptions> = HashMap::new();
-        for (i, w) in &wanted {
-            let m = &self.monitors[*i];
-            let o = wanted_opts.entry(w.video.clone()).or_insert(DecodeOptions {
-                max_size: Some((0, 0)),
-                low_power: self.cfg.general.gpu == crate::config::GpuPreference::Low,
-            });
-            let (mw, mh) = o.max_size.unwrap_or_default();
-            o.max_size = Some((mw.max(m.width as u32), mh.max(m.height as u32)));
-        }
-        // Nur Dekoder behalten, deren Datei und Zielgröße gleich geblieben sind.
-        self.players.retain(|p, e| wanted_opts.get(p) == Some(&e.opts));
-        for (path, opts) in wanted_opts {
-            self.players
-                .entry(path.clone())
-                .or_insert_with(|| PlayerEntry { player: Player::open(&path, opts), opts, tex: None, fresh: false });
-        }
-
         if !wanted.is_empty() {
             match DesktopHost::find() {
                 Ok(host) => {
-                    for (i, w) in wanted {
+                    for (i, w) in wanted.clone() {
                         match self.create_slot(&host, i, w) {
                             Ok(s) => self.slots.push(s),
                             Err(e) => log::error!("Monitor {}: {e:?}", i + 1),
@@ -211,6 +195,28 @@ impl App {
                     self.schedule_rebuild(Duration::from_secs(3));
                 }
             }
+        }
+
+        // Dekoder pro Datei: Zielgröße = größter Monitor, der sie zeigt. Erst nach den Fenstern anlegen –
+        // dann steht die Grafikkarte des Renderers fest, und der Dekoder kann per Zero-Copy liefern.
+        let gpu_luid = if self.zero_copy { self.gpu.zero_copy_luid() } else { None };
+        let mut wanted_opts: HashMap<PathBuf, DecodeOptions> = HashMap::new();
+        for (i, w) in &wanted {
+            let m = &self.monitors[*i];
+            let o = wanted_opts.entry(w.video.clone()).or_insert(DecodeOptions {
+                max_size: Some((0, 0)),
+                low_power: self.cfg.general.gpu == crate::config::GpuPreference::Low,
+                gpu_luid,
+            });
+            let (mw, mh) = o.max_size.unwrap_or_default();
+            o.max_size = Some((mw.max(m.width as u32), mh.max(m.height as u32)));
+        }
+        // Nur Dekoder behalten, deren Datei und Einstellungen gleich geblieben sind.
+        self.players.retain(|p, e| wanted_opts.get(p) == Some(&e.opts));
+        for (path, opts) in wanted_opts {
+            self.players
+                .entry(path.clone())
+                .or_insert_with(|| PlayerEntry { player: Player::open(&path, opts), opts, tex: None, fresh: false });
         }
 
         self.update_audio();
@@ -376,6 +382,7 @@ impl App {
 
         // Videos weiterlaufen lassen, deren Monitor sichtbar ist.
         let mut next_frame: Option<Duration> = None;
+        let mut zero_copy_failed = false;
         for (path, entry) in self.players.iter_mut() {
             entry.fresh = false;
             let active = self.slots.iter().any(|s| !s.paused && &s.wallpaper.video == path);
@@ -384,13 +391,29 @@ impl App {
             }
             entry.player.advance(dt);
             if let Some(frame) = entry.player.take_due() {
-                self.gpu.upload(&mut entry.tex, &frame);
+                match self.gpu.upload(&mut entry.tex, &frame) {
+                    Ok(released) => {
+                        if let Some(r) = released {
+                            entry.player.release(r);
+                        }
+                        entry.fresh = true;
+                    }
+                    Err(e) => {
+                        log::warn!("Zero-Copy fehlgeschlagen ({e:#}) – Bilder gehen ab jetzt über den Arbeitsspeicher");
+                        zero_copy_failed = true;
+                    }
+                }
                 entry.player.recycle(frame);
-                entry.fresh = true;
             }
             if let Some(d) = entry.player.next_due() {
                 next_frame = Some(next_frame.map_or(d, |n| n.min(d)));
             }
+        }
+
+        if zero_copy_failed && self.zero_copy {
+            self.zero_copy = false;
+            self.players.clear(); // mit Arbeitsspeicher-Weg neu starten
+            self.schedule_rebuild(Duration::ZERO);
         }
 
         let audio_on = self.audio.is_some();

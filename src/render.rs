@@ -3,8 +3,9 @@
 
 use crate::audio::Levels;
 use crate::config::{Backend, Effect, Fit, GpuPreference};
-use crate::video::Frame;
+use crate::video::{Frame, SlotRelease};
 use anyhow::{Context, Result};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
@@ -24,19 +25,59 @@ struct Dev {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
+    /// DX12 mit NV12-Texturen → geteilte Texturen des Dekoders direkt lesbar (Zero-Copy).
+    nv12: bool,
 }
 
-/// Y- und UV-Textur eines Videos.
+/// Das aktuelle Bild eines Videos, als Y- und UV-Ebene.
 pub struct VideoTex {
-    y: wgpu::Texture,
-    uv: wgpu::Texture,
-    y_view: wgpu::TextureView,
-    uv_view: wgpu::TextureView,
+    planes: Planes,
     width: u32,
     height: u32,
     crop: [f32; 4],
     bt709: bool,
-    generation: u64,
+}
+
+// Es gibt genau ein `Planes` pro Video – der Größenunterschied der Varianten ist bedeutungslos.
+#[allow(clippy::large_enum_variant)]
+enum Planes {
+    /// Eigene Texturen, Bilder werden hochgeladen.
+    Uploaded { y: wgpu::Texture, uv: wgpu::Texture, y_view: wgpu::TextureView, uv_view: wgpu::TextureView, generation: u64 },
+    /// Zero-Copy: geteilte Texturen des Dekoders, `current` = angezeigter Slot.
+    Shared(SharedTex),
+}
+
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+
+struct SharedTex {
+    ring: u64,
+    /// Pro Slot: Ebenen-Ansichten (die Textur lebt in den Ansichten weiter) und eine Kennung für den Bind-Group-Cache.
+    slots: Vec<(wgpu::TextureView, wgpu::TextureView, u64)>,
+    current: Option<usize>,
+    #[cfg(windows)]
+    ready: ID3D12Fence,
+    #[cfg(windows)]
+    released: ID3D12Fence,
+    /// Zuletzt nach dem Zeichnen signalisierter `released`-Wert.
+    render_value: Cell<u64>,
+}
+
+impl VideoTex {
+    fn views(&self) -> Option<(&wgpu::TextureView, &wgpu::TextureView, u64)> {
+        match &self.planes {
+            Planes::Uploaded { y_view, uv_view, generation, .. } => Some((y_view, uv_view, *generation)),
+            Planes::Shared(s) => s.current.map(|c| (&s.slots[c].0, &s.slots[c].1, s.slots[c].2)),
+        }
+    }
+
+    /// Den angezeigten Ring-Slot abgeben (wenn das Video wechselt oder auf den Arbeitsspeicher-Weg zurückfällt).
+    fn release_current(&self) -> Option<SlotRelease> {
+        match &self.planes {
+            Planes::Shared(s) => s.current.map(|slot| SlotRelease { ring: s.ring, slot, after: s.render_value.get() }),
+            Planes::Uploaded { .. } => None,
+        }
+    }
 }
 
 /// Eine Fensteroberfläche (ein Monitor).
@@ -44,7 +85,8 @@ pub struct Target {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     uniforms: wgpu::Buffer,
-    bind: Option<(wgpu::BindGroup, u64)>,
+    /// Bind Groups je Textur(-Slot); beim Zero-Copy-Ring wechseln sie jedes Bild, daher ein kleiner Cache.
+    binds: Vec<(u64, wgpu::BindGroup)>,
 }
 
 pub struct DrawParams {
@@ -98,8 +140,11 @@ impl Dev {
         let info = adapter.get_info();
         log::info!("GPU gewählt: {} ({:?})", info.name, info.backend);
 
+        // NV12-Texturen (nur DX12/Vulkan) erlauben, geteilte Texturen des Dekoders direkt zu lesen.
+        let nv12 = info.backend == wgpu::Backend::Dx12 && adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_NV12);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("veyra"),
+            required_features: if nv12 { wgpu::Features::TEXTURE_FORMAT_NV12 } else { wgpu::Features::empty() },
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
@@ -180,7 +225,7 @@ impl Dev {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Ok(Self { adapter, device, queue, pipeline, layout, sampler, format })
+        Ok(Self { adapter, device, queue, pipeline, layout, sampler, format, nv12 })
     }
 }
 
@@ -230,33 +275,81 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Ok(Target { surface, config, uniforms, bind: None })
+        Ok(Target { surface, config, uniforms, binds: Vec::new() })
     }
 
-    /// Bild hochladen; legt Texturen neu an, wenn sich die Größe geändert hat.
-    pub fn upload(&self, tex: &mut Option<VideoTex>, f: &Frame) {
+    /// Grafikkarte des Renderers (LUID) – nur wenn er geteilte NV12-Texturen öffnen kann (DX12).
+    /// Der Dekoder läuft dann auf genau dieser GPU und liefert Bilder ohne Umweg über den Arbeitsspeicher.
+    pub fn zero_copy_luid(&self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            let d = self.dev.as_ref().filter(|d| d.nv12)?;
+            // SAFETY: nur lesender Zugriff auf das rohe Gerät.
+            let hal = unsafe { d.device.as_hal::<wgpu::hal::api::Dx12>() }?;
+            let l = unsafe { hal.raw_device().GetAdapterLuid() };
+            Some(((l.HighPart as u32 as u64) << 32) | l.LowPart as u64)
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// Neues Bild übernehmen. Zero-Copy: nur den Slot umschalten; sonst Pixel hochladen.
+    /// Liefert den vorher angezeigten Ring-Slot zurück, den der Dekoder wieder füllen darf.
+    pub fn upload(&self, tex: &mut Option<VideoTex>, f: &Frame) -> Result<Option<SlotRelease>> {
+        #[cfg(windows)]
+        if let Some(g) = &f.gpu {
+            return self.show_shared(tex, f, g);
+        }
         let d = self.dev();
-        let fits = tex.as_ref().is_some_and(|t| t.width == f.width && t.height == f.height);
+        let fits = tex.as_ref().is_some_and(|t| matches!(t.planes, Planes::Uploaded { .. }) && t.width == f.width && t.height == f.height);
+        let mut released = None;
         if !fits {
+            released = tex.as_ref().and_then(VideoTex::release_current);
             *tex = Some(d.create_video_tex(f.width, f.height));
         }
         let t = tex.as_mut().unwrap();
         t.crop = f.crop;
         t.bt709 = f.bt709;
+        let Planes::Uploaded { y, uv, .. } = &t.planes else { unreachable!() };
         let uv_w = f.width.div_ceil(2);
         let uv_h = f.height.div_ceil(2);
         d.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &t.y, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: y, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(f.pitch), rows_per_image: None },
             wgpu::Extent3d { width: f.width, height: f.height, depth_or_array_layers: 1 },
         );
         d.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &t.uv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: uv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data,
             wgpu::TexelCopyBufferLayout { offset: f.uv_offset() as u64, bytes_per_row: Some(f.pitch), rows_per_image: None },
             wgpu::Extent3d { width: uv_w, height: uv_h, depth_or_array_layers: 1 },
         );
+        Ok(released)
+    }
+
+    /// Zero-Copy: Slot des neuen Bildes anzeigen, vorher die GPU auf das Fertig-Signal des Dekoders warten lassen.
+    #[cfg(windows)]
+    fn show_shared(&self, tex: &mut Option<VideoTex>, f: &Frame, g: &crate::video::GpuFrame) -> Result<Option<SlotRelease>> {
+        let d = self.dev();
+        let mut released = None;
+        let same_ring = tex.as_ref().is_some_and(|t| matches!(&t.planes, Planes::Shared(s) if s.ring == g.ring.id));
+        if !same_ring {
+            released = tex.as_ref().and_then(VideoTex::release_current);
+            *tex = Some(d.import_ring(&g.ring)?);
+        }
+        let t = tex.as_mut().unwrap();
+        t.crop = f.crop;
+        t.bt709 = f.bt709;
+        let Planes::Shared(s) = &mut t.planes else { unreachable!() };
+        // SAFETY: die Fence stammt vom selben Gerät; die Wartebedingung gilt für die nächste Übergabe.
+        let q = unsafe { d.queue.as_hal::<wgpu::hal::api::Dx12>() }.context("DX12-Queue nicht verfügbar")?;
+        q.add_wait_fence(s.ready.clone(), g.ready_value);
+        let previous = s.current.replace(g.slot);
+        if released.is_none() {
+            released = previous.map(|slot| SlotRelease { ring: s.ring, slot, after: s.render_value.get() });
+        }
+        Ok(released)
     }
 
 }
@@ -278,16 +371,80 @@ impl Dev {
         let y = mk(width, height, wgpu::TextureFormat::R8Unorm);
         let uv = mk(width.div_ceil(2), height.div_ceil(2), wgpu::TextureFormat::Rg8Unorm);
         VideoTex {
-            y_view: y.create_view(&Default::default()),
-            uv_view: uv.create_view(&Default::default()),
-            y,
-            uv,
+            planes: Planes::Uploaded {
+                y_view: y.create_view(&Default::default()),
+                uv_view: uv.create_view(&Default::default()),
+                y,
+                uv,
+                generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            },
             width,
             height,
             crop: [0.0, 0.0, 1.0, 1.0],
             bt709: true,
-            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Geteilte Texturen und Fences des Dekoders in DX12 öffnen und als wgpu-Texturen einbinden.
+    #[cfg(windows)]
+    fn import_ring(&self, ring: &crate::video::SharedRing) -> Result<VideoTex> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        let (resources, ready, released) = {
+            // SAFETY: rohes Gerät nur zum Öffnen der Handles; die Sperre endet mit diesem Block.
+            let hal = unsafe { self.device.as_hal::<wgpu::hal::api::Dx12>() }.context("kein DX12-Gerät")?;
+            let raw = hal.raw_device();
+            let open_res = |h: isize| -> Result<ID3D12Resource> {
+                let mut r = None;
+                unsafe { raw.OpenSharedHandle(HANDLE(h as *mut _), &mut r) }.context("geteilte Textur öffnen")?;
+                r.context("OpenSharedHandle")
+            };
+            let open_fence = |h: isize| -> Result<ID3D12Fence> {
+                let mut r = None;
+                unsafe { raw.OpenSharedHandle(HANDLE(h as *mut _), &mut r) }.context("geteilte Fence öffnen")?;
+                r.context("OpenSharedHandle")
+            };
+            let res = ring.textures.iter().map(|&h| open_res(h)).collect::<Result<Vec<_>>>()?;
+            (res, open_fence(ring.ready_fence)?, open_fence(ring.released_fence)?)
+        };
+        let size = wgpu::Extent3d { width: ring.width, height: ring.height, depth_or_array_layers: 1 };
+        let slots = resources
+            .into_iter()
+            .map(|res| {
+                // SAFETY: NV12-Ressource passender Größe, nur zum Lesen im Shader (Zustand COMMON → implizit lesbar).
+                let tex = unsafe {
+                    let hal_tex = wgpu::hal::dx12::Device::texture_from_raw(res, wgpu::TextureFormat::NV12, wgpu::TextureDimension::D2, size, 1, 1);
+                    self.device.create_texture_from_hal::<wgpu::hal::api::Dx12>(
+                        hal_tex,
+                        &wgpu::TextureDescriptor {
+                            label: Some("veyra-shared"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::NV12,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        },
+                        wgpu::wgt::TextureUses::RESOURCE,
+                    )
+                };
+                let plane = |format, aspect| tex.create_view(&wgpu::TextureViewDescriptor { format: Some(format), aspect, ..Default::default() });
+                (
+                    plane(wgpu::TextureFormat::R8Unorm, wgpu::TextureAspect::Plane0),
+                    plane(wgpu::TextureFormat::Rg8Unorm, wgpu::TextureAspect::Plane1),
+                    GENERATION.fetch_add(1, Ordering::Relaxed),
+                )
+            })
+            .collect();
+        log::info!("Zero-Copy aktiv: {} geteilte Texturen {}x{}", ring.textures.len(), ring.width, ring.height);
+        Ok(VideoTex {
+            planes: Planes::Shared(SharedTex { ring: ring.id, slots, current: None, ready, released, render_value: Cell::new(0) }),
+            width: ring.width,
+            height: ring.height,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            bt709: true,
+        })
     }
 
 }
@@ -295,19 +452,28 @@ impl Dev {
 impl Gpu {
     pub fn render(&self, target: &mut Target, tex: &VideoTex, p: &DrawParams) {
         let d = self.dev();
-        if target.bind.as_ref().map(|b| b.1) != Some(tex.generation) {
-            let bg = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &d.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: target.uniforms.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex.y_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex.uv_view) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&d.sampler) },
-                ],
-            });
-            target.bind = Some((bg, tex.generation));
-        }
+        let Some((y_view, uv_view, generation)) = tex.views() else { return };
+        let bind = match target.binds.iter().position(|(g, _)| *g == generation) {
+            Some(i) => i,
+            None => {
+                let bg = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &d.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: target.uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(y_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(uv_view) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&d.sampler) },
+                    ],
+                });
+                // Klein halten: ein Ring hat wenige Slots, ältere Einträge gehören zu verworfenen Texturen.
+                if target.binds.len() >= crate::video::RING + 2 {
+                    target.binds.remove(0);
+                }
+                target.binds.push((generation, bg));
+                target.binds.len() - 1
+            }
+        };
 
         let vis_w = tex.width as f32 * tex.crop[2];
         let vis_h = tex.height as f32 * tex.crop[3];
@@ -358,8 +524,17 @@ impl Gpu {
                 ..Default::default()
             });
             pass.set_pipeline(&d.pipeline);
-            pass.set_bind_group(0, &target.bind.as_ref().unwrap().0, &[]);
+            pass.set_bind_group(0, &target.binds[bind].1, &[]);
             pass.draw(0..3, 0..1);
+        }
+        // Zero-Copy: nach diesem Zeichnen darf der Dekoder den Slot wieder überschreiben.
+        #[cfg(windows)]
+        if let Planes::Shared(s) = &tex.planes {
+            if let Some(q) = unsafe { d.queue.as_hal::<wgpu::hal::api::Dx12>() } {
+                let v = s.render_value.get() + 1;
+                q.add_signal_fence(s.released.clone(), v);
+                s.render_value.set(v);
+            }
         }
         d.queue.submit([enc.finish()]);
         d.queue.present(frame);

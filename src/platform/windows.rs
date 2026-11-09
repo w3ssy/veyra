@@ -441,7 +441,9 @@ impl WallpaperWindow {
     }
 
     pub fn raw_handles(&self) -> (RawDisplayHandle, RawWindowHandle) {
-        let h = wgpu::rwh::Win32WindowHandle::new(std::num::NonZeroIsize::new(self.hwnd.0 as isize).expect("HWND"));
+        let mut h = wgpu::rwh::Win32WindowHandle::new(std::num::NonZeroIsize::new(self.hwnd.0 as isize).expect("HWND"));
+        // Vulkan braucht zusätzlich die Modul-Instanz (DX12 kommt ohne aus).
+        h.hinstance = unsafe { GetModuleHandleW(None) }.ok().and_then(|m| std::num::NonZeroIsize::new(m.0 as isize));
         (RawDisplayHandle::Windows(wgpu::rwh::WindowsDisplayHandle::new()), RawWindowHandle::Win32(h))
     }
 

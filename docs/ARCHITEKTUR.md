@@ -78,23 +78,30 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
 
 ## Performance-Strategie
 
-1. **Hardware-Dekodierung** (DXVA über ein eigenes D3D11-Gerät). Die CPU dekodiert nichts.
-2. **NV12 statt RGBA**: 1,5 statt 4 Byte pro Pixel beim Kopieren; Farbumrechnung im Shader (praktisch kostenlos).
-3. **Nur zeichnen, wenn nötig**: ein Monitor wird nur neu gezeichnet, wenn ein neues Videobild fällig ist
+1. **Hardware-Dekodierung** (DXVA über ein eigenes D3D11-Gerät auf derselben GPU wie die Ausgabe). Die CPU dekodiert nichts.
+2. **Zero-Copy**: Nutzt der Renderer DX12, kopiert der Dekoder jedes Bild GPU-intern in einen Ring aus 6 geteilten
+   NV12-Texturen (`SharedRing`), die wgpu direkt als Y-/UV-Ebene liest. Zwei geteilte Fences synchronisieren:
+   *ready* (Dekoder → Renderer: Bild fertig) und *released* (Renderer → Dekoder: Slot darf überschrieben werden).
+   Die Pixel verlassen nie den Grafikspeicher; skaliert wird beim Zeichnen im Shader.
+   Rückfall (Vulkan, andere GPU, Fehler beim Öffnen): Bild in den Arbeitsspeicher kopieren und hochladen – dann
+   verkleinert der Videoprozessor große Videos vorher auf Monitorgröße (4K → 1080p = ¼ der Daten).
+3. **NV12 statt RGBA**: 1,5 statt 4 Byte pro Pixel; Farbumrechnung im Shader (praktisch kostenlos).
+4. **Nur zeichnen, wenn nötig**: ein Monitor wird nur neu gezeichnet, wenn ein neues Videobild fällig ist
    (30-fps-Video = 30 Zeichnungen/s, auch auf einem 144-Hz-Monitor) oder ein Audio-Effekt bei hörbarem Ton läuft.
-4. **Geteilte Dekoder**: zeigen 3 Monitore dasselbe Video, wird es einmal dekodiert und einmal hochgeladen.
-5. **Gegendruck statt Polling**: Pausiert → Bild-Warteschlange voll → Dekoder-Thread blockiert → 0 % CPU.
+5. **Geteilte Dekoder**: zeigen 3 Monitore dasselbe Video, wird es einmal dekodiert und einmal hochgeladen.
+6. **Gegendruck statt Polling**: Pausiert → Bild-Warteschlange voll → Dekoder-Thread blockiert → 0 % CPU.
    Der Haupt-Thread schläft dann 500 ms am Stück; Audio-Mitschnitt wird komplett gestoppt.
    Pausiert wird u. a. auch, wenn der Bildschirm ausgeschaltet ist (`GUID_CONSOLE_DISPLAY_STATE`).
-6. **Puffer-Recycling**: Bildpuffer wandern zurück zum Dekoder, keine Allokation pro Bild.
-7. **`gpu = "low"`**: bevorzugt die integrierte GPU, die dedizierte kann schlafen.
-8. **Kleine Warteschlangen**: max. 3 Bilder vorgepuffert, `desired_maximum_frame_latency = 1`.
+7. **Puffer-/Slot-Recycling**: Bildpuffer wandern zurück zum Dekoder, keine Allokation pro Bild.
+8. **`gpu = "low"`**: bevorzugt die integrierte GPU, die dedizierte kann schlafen.
+9. **Kleine Warteschlangen**: max. 3 Bilder vorgepuffert, `desired_maximum_frame_latency = 1`.
 
 ### Bekannte Optimierungsreserve (Roadmap)
 
-- **Zero-Copy**: Das dekodierte Bild liegt bereits im VRAM, wird aber für den Upload einmal in den RAM kopiert
-  (GPU→CPU→GPU). Ein geteiltes D3D11/D3D12-Handle (`IDXGIResource1::CreateSharedHandle`) würde diesen Umweg
-  entfernen. Für 1080p30 ist der Umweg unkritisch (~90 MB/s), bei 4K60 lohnt er sich.
+- **Präsentieren**: Jeder Monitor wird einzeln übergeben (bei 3 Monitoren × 60 fps = 180 Übergaben/s); das ist
+  inzwischen der größte CPU-Anteil. Ein gemeinsamer Submit für alle Monitore würde ihn verringern.
+- **GPU-Wahl**: Hängen die Monitore an der dedizierten GPU, ist `gpu = "high"` trotz des Namens oft sparsamer
+  (sonst kopiert Windows jedes Bild zwischen den Grafikkarten). Ein `gpu = "auto"` nach Monitor-Anschluss wäre sinnvoll.
 - Bildrate des Videos auf `max_fps` drosseln, *bevor* dekodiert wird (heute wird jedes Bild dekodiert,
   überzählige werden verworfen). Am einfachsten: Video passend kodieren (siehe README).
 - Mehrere Monitore präsentieren nacheinander mit VSync; bei sehr unterschiedlichen Bildwiederholraten
@@ -141,5 +148,5 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
    *(Erledigt: Einstellungsfenster mit Monitor-Übersicht und Video-Bibliothek, Pause bei ausgeschaltetem Bildschirm,
    Wächter für die Desktop-Einbettung, Release-Builds per GitHub Actions.)* *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
    ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*
-3. **v0.3**: Zero-Copy-Pfad.
+3. **v0.3**: Zero-Copy-Pfad *(erledigt)*; `gpu = "auto"` nach Monitor-Anschluss.
 4. **v0.4**: Linux (Wayland zuerst).

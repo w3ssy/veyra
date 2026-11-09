@@ -1,7 +1,10 @@
 //! Media Foundation: in Windows eingebauter, per Windows Update gepflegter Dekoder.
 //! Hardware-Dekodierung (DXVA) über ein eigenes D3D11-Gerät, Ausgabe NV12, Endlosschleife.
+//!
+//! Zero-Copy (wenn der Renderer DX12 auf derselben GPU nutzt): Jedes Bild wird auf der GPU in einen Ring
+//! geteilter NV12-Texturen kopiert, die der Renderer direkt liest. Sonst: Bild in den Arbeitsspeicher kopieren.
 
-use super::{DecodeOptions, Frame};
+use super::{DecodeOptions, Frame, GpuFrame, Recycled, SharedRing, RING};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +14,7 @@ use std::time::Duration;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Media::MediaFoundation::*;
@@ -29,7 +32,7 @@ struct Format {
     bt709: bool,
 }
 
-pub fn decode_loop(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
+pub fn decode_loop(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Recycled>, stop: &Arc<AtomicBool>) -> Result<()> {
     if !path.is_file() {
         bail!("Datei nicht gefunden");
     }
@@ -42,7 +45,7 @@ pub fn decode_loop(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, poo
     }
 }
 
-unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) -> Result<()> {
+unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &Receiver<Recycled>, stop: &Arc<AtomicBool>) -> Result<()> {
     let attrs = {
         let mut a = None;
         MFCreateAttributes(&mut a, 4)?;
@@ -50,11 +53,19 @@ unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &R
     };
 
     // Hardware-Dekodierung: D3D11-Gerät mit Video-Unterstützung an den Source Reader geben.
-    match create_dxgi_manager(opts.low_power) {
-        Ok((mgr, gpu)) => {
+    let mut zero_copy: Option<ZeroCopy> = None;
+    match create_dxgi_manager(opts) {
+        Ok((mgr, device, gpu)) => {
             attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &mgr)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            log::info!("Hardware-Dekodierung auf {gpu} für {path:?}");
+            if opts.gpu_luid.is_some() {
+                match ZeroCopy::new(device) {
+                    Ok(z) => zero_copy = Some(z),
+                    Err(e) => log::warn!("Zero-Copy nicht möglich ({e:#}), Bilder gehen über den Arbeitsspeicher"),
+                }
+            }
+            let mode = if zero_copy.is_some() { "Zero-Copy" } else { "über Arbeitsspeicher" };
+            log::info!("Hardware-Dekodierung auf {gpu} ({mode}) für {path:?}");
         }
         Err(e) => log::warn!("Keine Hardware-Dekodierung ({e}), nutze Software-Dekoder"),
     }
@@ -76,9 +87,12 @@ unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &R
     let mut fmt = read_format(&reader)?;
     log::info!("{path:?}: {}x{}, {:.2} fps", fmt.width, fmt.height, 1.0 / fmt.frame_dur.as_secs_f64());
 
-    // Größer als der Monitor? Dann verkleinert der Videoprozessor auf der GPU – das spart vor allem
-    // das teure Zurücklesen jedes Bildes in den Arbeitsspeicher (4K → 1080p = ¼ der Daten).
-    if let Some((w, h)) = opts.max_size.and_then(|m| super::scaled_size((fmt.width, fmt.height), m)) {
+    // Größer als der Monitor? Ohne Zero-Copy verkleinert der Videoprozessor auf der GPU – das spart vor
+    // allem das teure Zurücklesen jedes Bildes in den Arbeitsspeicher (4K → 1080p = ¼ der Daten).
+    // Mit Zero-Copy entfällt das Zurücklesen; dann ist es günstiger, der Shader verkleinert beim Zeichnen
+    // (gemessen: 3D-Last RTX 4070 18 % → 11 %, AMD-iGPU 57 % → 44 %).
+    let scale_to = if zero_copy.is_none() { opts.max_size } else { None };
+    if let Some((w, h)) = scale_to.and_then(|m| super::scaled_size((fmt.width, fmt.height), m)) {
         let small = MFCreateMediaType()?;
         small.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         small.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -127,8 +141,24 @@ unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &R
         last_pts = pts;
         frames_in_pass += 1;
 
-        let buf = pool.try_recv().unwrap_or_default();
-        let frame = copy_sample(&sample, &fmt, buf, pts)?;
+        let frame = match zero_copy.as_mut().map(|z| z.push(&sample, &fmt, pts, pool, stop)) {
+            Some(Ok(Some(f))) => f,
+            Some(Ok(None)) => return Ok(()), // beendet, während auf einen freien Slot gewartet wurde
+            other => {
+                if let Some(Err(e)) = other {
+                    log::warn!("Zero-Copy abgeschaltet ({e:#}), Bilder gehen ab jetzt über den Arbeitsspeicher");
+                    zero_copy = None;
+                }
+                // Arbeitsspeicher-Weg: einen zurückgegebenen Puffer wiederverwenden.
+                let buf = std::iter::from_fn(|| pool.try_recv().ok())
+                    .find_map(|r| match r {
+                        Recycled::Buffer(b) => Some(b),
+                        Recycled::Slot(_) => None,
+                    })
+                    .unwrap_or_default();
+                copy_sample(&sample, &fmt, buf, pts)?
+            }
+        };
 
         // Blockiert ohne CPU-Last, solange die Warteschlange voll ist (z. B. pausiert).
         // Wird der Player freigegeben, schlägt send fehl und der Thread endet.
@@ -139,13 +169,17 @@ unsafe fn run(path: &Path, opts: DecodeOptions, tx: &SyncSender<Frame>, pool: &R
     Ok(())
 }
 
-/// D3D11-Gerät für die Hardware-Dekodierung – auf derselben GPU-Sorte wie die Ausgabe (`gpu = "low"/"high"`).
-/// Sonst landet der Dekoder auf der Standard-GPU, und jedes Bild wandert zusätzlich zwischen zwei Grafikkarten.
-unsafe fn create_dxgi_manager(low_power: bool) -> Result<(IMFDXGIDeviceManager, String)> {
+/// D3D11-Gerät für die Hardware-Dekodierung – auf der GPU des Renderers (Zero-Copy: exakt dieselbe, per LUID),
+/// sonst auf derselben GPU-Sorte (`gpu = "low"/"high"`). Ohne das landet der Dekoder auf der Standard-GPU,
+/// und jedes Bild wandert zusätzlich zwischen zwei Grafikkarten.
+unsafe fn create_dxgi_manager(opts: DecodeOptions) -> Result<(IMFDXGIDeviceManager, ID3D11Device, String)> {
     use windows::Win32::Graphics::Dxgi::*;
-    let pref = if low_power { DXGI_GPU_PREFERENCE_MINIMUM_POWER } else { DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE };
-    let adapter: Option<IDXGIAdapter1> =
-        CreateDXGIFactory1::<IDXGIFactory6>().ok().and_then(|f| f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, pref).ok());
+    let pref = if opts.low_power { DXGI_GPU_PREFERENCE_MINIMUM_POWER } else { DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE };
+    let factory = CreateDXGIFactory1::<IDXGIFactory6>().ok();
+    let adapter: Option<IDXGIAdapter1> = factory.as_ref().and_then(|f| {
+        let by_luid = opts.gpu_luid.and_then(|l| f.EnumAdapterByLuid::<IDXGIAdapter1>(LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 }).ok());
+        by_luid.or_else(|| f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, pref).ok())
+    });
     let name = adapter
         .as_ref()
         .and_then(|a| a.GetDesc1().ok())
@@ -174,7 +208,170 @@ unsafe fn create_dxgi_manager(low_power: bool) -> Result<(IMFDXGIDeviceManager, 
     MFCreateDXGIDeviceManager(&mut token, &mut mgr)?;
     let mgr = mgr.context("kein DXGI-Manager")?;
     mgr.ResetDevice(&device, token)?;
-    Ok((mgr, name))
+    Ok((mgr, device, name))
+}
+
+// ───────────────────────────── Zero-Copy ─────────────────────────────
+
+/// Kopiert dekodierte Bilder auf der GPU in einen Ring geteilter Texturen.
+struct ZeroCopy {
+    device: ID3D11Device,
+    ctx: ID3D11DeviceContext4,
+    /// Media Foundation nutzt dasselbe Gerät aus eigenen Threads.
+    mt: ID3D11Multithread,
+    ready: ID3D11Fence,
+    released: ID3D11Fence,
+    ready_value: u64,
+    ring: Option<Arc<SharedRing>>,
+    textures: Vec<ID3D11Texture2D>,
+    /// Freie Slots mit dem `released`-Wert, ab dem sie überschrieben werden dürfen.
+    free: Vec<(usize, u64)>,
+}
+
+static RING_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl ZeroCopy {
+    unsafe fn new(device: ID3D11Device) -> Result<Self> {
+        let d5: ID3D11Device5 = device.cast().context("D3D11.4 (ID3D11Device5) fehlt")?;
+        let fence = || -> Result<ID3D11Fence> {
+            let mut f = None;
+            d5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut f)?;
+            f.context("CreateFence")
+        };
+        let (ready, released) = (fence()?, fence()?);
+        let ctx: ID3D11DeviceContext4 = device.GetImmediateContext()?.cast().context("ID3D11DeviceContext4 fehlt")?;
+        let mt: ID3D11Multithread = device.cast()?;
+        Ok(Self { device, ctx, mt, ready, released, ready_value: 0, ring: None, textures: Vec::new(), free: Vec::new() })
+    }
+
+    /// Ring passend zur Bildgröße (neu) anlegen.
+    unsafe fn ensure_ring(&mut self, width: u32, height: u32) -> Result<Arc<SharedRing>> {
+        if let Some(r) = self.ring.as_ref().filter(|r| r.width == width && r.height == height) {
+            return Ok(r.clone());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+        };
+        let mut textures = Vec::with_capacity(RING);
+        let mut handles = Vec::with_capacity(RING);
+        for _ in 0..RING {
+            let mut t = None;
+            self.device.CreateTexture2D(&desc, None, Some(&mut t)).context("geteilte NV12-Textur anlegen")?;
+            let t = t.context("CreateTexture2D")?;
+            let res: windows::Win32::Graphics::Dxgi::IDXGIResource1 = t.cast()?;
+            let access = windows::Win32::Graphics::Dxgi::DXGI_SHARED_RESOURCE_READ | windows::Win32::Graphics::Dxgi::DXGI_SHARED_RESOURCE_WRITE;
+            handles.push(res.CreateSharedHandle(None, access.0, windows::core::PCWSTR::null())?.0 as isize);
+            textures.push(t);
+        }
+        let ready = self.ready.CreateSharedHandle(None, GENERIC_ALL.0, windows::core::PCWSTR::null())?.0 as isize;
+        let released = self.released.CreateSharedHandle(None, GENERIC_ALL.0, windows::core::PCWSTR::null())?.0 as isize;
+        let ring = Arc::new(SharedRing {
+            id: RING_ID.fetch_add(1, Ordering::Relaxed),
+            textures: handles,
+            ready_fence: ready,
+            released_fence: released,
+            width,
+            height,
+        });
+        // Neue Texturen: alle Slots frei. Der `released`-Wert läuft über Ringe hinweg weiter.
+        self.free = (0..RING).map(|i| (i, 0)).collect();
+        self.textures = textures;
+        self.ring = Some(ring.clone());
+        Ok(ring)
+    }
+
+    /// Bild in einen freien Slot kopieren. `Ok(None)` = beendet, während auf einen Slot gewartet wurde.
+    unsafe fn push(&mut self, sample: &IMFSample, fmt: &Format, pts: Duration, pool: &Receiver<Recycled>, stop: &AtomicBool) -> Result<Option<Frame>> {
+        let buffer = sample.GetBufferByIndex(0)?;
+        let dxgi: IMFDXGIBuffer = buffer.cast().context("Bild liegt nicht auf der GPU")?;
+        let mut raw = std::ptr::null_mut();
+        dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw)?;
+        let src = ID3D11Texture2D::from_raw(raw);
+        let sub = dxgi.GetSubresourceIndex()?;
+        let mut sd = D3D11_TEXTURE2D_DESC::default();
+        src.GetDesc(&mut sd);
+        if sd.Format != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12 {
+            bail!("Dekoder liefert {:?} statt NV12", sd.Format);
+        }
+        // NV12 braucht gerade Maße; nie mehr kopieren, als die Quelle hat.
+        let w = fmt.width.min(sd.Width) & !1;
+        let h = fmt.height.min(sd.Height) & !1;
+        let ring = self.ensure_ring(w, h)?;
+
+        // Freien Slot holen – blockiert ohne CPU-Last, bis der Renderer einen zurückgibt.
+        let (slot, after) = loop {
+            while let Ok(r) = pool.try_recv() {
+                self.take_back(r, ring.id);
+            }
+            if let Some(s) = self.free.pop() {
+                break s;
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if let Ok(r) = pool.recv_timeout(Duration::from_millis(100)) {
+                self.take_back(r, ring.id);
+            }
+        };
+
+        self.mt.Enter();
+        let r = (|| -> Result<()> {
+            if after > 0 {
+                // GPU wartet, bis der Renderer mit diesem Slot fertig ist (blockiert nicht die CPU).
+                self.ctx.Wait(&self.released, after)?;
+            }
+            let bx = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+            self.ctx.CopySubresourceRegion(&self.textures[slot], 0, 0, 0, 0, &src, sub, Some(&bx));
+            self.ready_value += 1;
+            self.ctx.Signal(&self.ready, self.ready_value)?;
+            self.ctx.Flush();
+            Ok(())
+        })();
+        self.mt.Leave();
+        if let Err(e) = r {
+            self.free.push((slot, after));
+            return Err(e);
+        }
+        let crop = [fmt.crop[0] * fmt.width as f32 / w as f32, fmt.crop[1] * fmt.height as f32 / h as f32, fmt.crop[2] * fmt.width as f32 / w as f32, fmt.crop[3] * fmt.height as f32 / h as f32];
+        Ok(Some(Frame {
+            data: Vec::new(),
+            gpu: Some(GpuFrame { ring, slot, ready_value: self.ready_value }),
+            pitch: 0,
+            width: w,
+            height: h,
+            y_rows: h,
+            crop: crop.map(|c| c.min(1.0)),
+            pts,
+            bt709: fmt.bt709,
+        }))
+    }
+
+    fn take_back(&mut self, r: Recycled, ring: u64) {
+        if let Recycled::Slot(s) = r {
+            if s.ring == ring && !self.free.iter().any(|(i, _)| *i == s.slot) {
+                self.free.push((s.slot, s.after));
+            }
+        }
+    }
+}
+
+impl Drop for SharedRing {
+    fn drop(&mut self) {
+        unsafe {
+            for &h in self.textures.iter().chain([&self.ready_fence, &self.released_fence]) {
+                let _ = CloseHandle(HANDLE(h as *mut _));
+            }
+        }
+    }
 }
 
 unsafe fn read_format(reader: &IMFSourceReader) -> Result<Format> {
@@ -241,7 +438,7 @@ unsafe fn copy_sample(sample: &IMFSample, fmt: &Format, mut data: Vec<u8>, pts: 
         })();
         let _ = b2.Unlock2D();
         let (pitch, y_rows) = result?;
-        return Ok(Frame { data, pitch, width: fmt.width, height: fmt.height, y_rows, crop: fmt.crop, pts, bt709: fmt.bt709 });
+        return Ok(Frame { data, gpu: None, pitch, width: fmt.width, height: fmt.height, y_rows, crop: fmt.crop, pts, bt709: fmt.bt709 });
     }
 
     // Fallback: zusammenhängender Speicher, Pitch aus dem Medientyp.
@@ -259,7 +456,7 @@ unsafe fn copy_sample(sample: &IMFSample, fmt: &Format, mut data: Vec<u8>, pts: 
     if !ok {
         bail!("Puffer zu klein ({len} < {needed})");
     }
-    Ok(Frame { data, pitch: pitch as u32, width: fmt.width, height: fmt.height, y_rows: fmt.height, crop: fmt.crop, pts, bt709: fmt.bt709 })
+    Ok(Frame { data, gpu: None, pitch: pitch as u32, width: fmt.width, height: fmt.height, y_rows: fmt.height, crop: fmt.crop, pts, bt709: fmt.bt709 })
 }
 
 // ───────────────────────────── Vorschaubild ─────────────────────────────
