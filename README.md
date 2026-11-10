@@ -157,7 +157,7 @@ Siehe Abschnitt „Sicherheitsmodell“ in [docs/ARCHITEKTUR.md](docs/ARCHITEKTU
 
 ## Stand
 
-Veyra ist in der **Beta** (v0.2). Getestet unter Windows 11 24H2 mit AMD- und NVIDIA-Grafik; jeder Push
+Veyra ist in der **Beta** (v0.3). Getestet unter Windows 11 24H2 mit AMD- und NVIDIA-Grafik; jeder Push
 wird per GitHub Actions mit Clippy und Unit-Tests geprüft.
 Je nach Windows-Version und Grafiktreiber kann es noch Ecken geben – v. a. bei der Desktop-Einbettung
 und bei Zero-Copy (fällt bei Problemen automatisch auf den Weg über den Arbeitsspeicher zurück).
