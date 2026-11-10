@@ -28,7 +28,9 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item target/release/veyra.exe veyra.exe
-          (Get-FileHash veyra.exe -Algorithm SHA256).Hash.ToLower() + "  veyra.exe" | Out-File -Encoding ascii veyra.exe.sha256
+          # Mit "\n" statt Windows-Zeilenende, damit auch `sha256sum -c` (Linux, Git Bash) die Datei lesen kann.
+          $line = (Get-FileHash veyra.exe -Algorithm SHA256).Hash.ToLower() + "  veyra.exe`n"
+          [IO.File]::WriteAllText("$PWD/veyra.exe.sha256", $line, [Text.Encoding]::ASCII)
       - uses: softprops/action-gh-release@v2
         with:
           files: |
