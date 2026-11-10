@@ -10,6 +10,7 @@ pub struct Config {
     pub general: General,
     pub audio: Audio,
     pub library: Library,
+    pub widgets: Widgets,
     #[serde(rename = "wallpaper")]
     pub wallpapers: Vec<Wallpaper>,
 }
@@ -69,6 +70,132 @@ pub struct Audio {
 pub struct Library {
     /// Leer = der Windows-Ordner „Videos“.
     pub folder: PathBuf,
+}
+
+/// Einblendungen über dem Video (Uhr, nächster Raketenstart).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Widgets {
+    /// Auf welchem Monitor: "all", "primary" oder Monitor-Nummer.
+    pub monitor: MonitorSel,
+    /// Größe (0.5 – 2.0, 1.0 = Standard für 1080p, skaliert mit der Monitorhöhe).
+    pub scale: f32,
+    pub clock: ClockWidget,
+    pub flight_control: FlightControlWidget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClockWidget {
+    pub enabled: bool,
+    pub position: Position,
+    pub seconds: bool,
+    pub date: bool,
+}
+
+/// Countdown zum nächsten Raketenstart. Einzige Funktion mit Netzwerkzugriff – standardmäßig aus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlightControlWidget {
+    pub enabled: bool,
+    pub position: Position,
+}
+
+/// Position auf dem Monitor (3 × 3 Raster, innerhalb des Arbeitsbereichs – nie unter der Taskleiste).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum Position {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Position {
+    /// Zeilenweise von oben links nach unten rechts (passt zum 3 × 3 Raster).
+    pub const ALL: [Position; 9] = [
+        Position::TopLeft,
+        Position::Top,
+        Position::TopRight,
+        Position::Left,
+        Position::Center,
+        Position::Right,
+        Position::BottomLeft,
+        Position::Bottom,
+        Position::BottomRight,
+    ];
+
+    /// Spalte und Zeile, jeweils 0 (links/oben), 1 (Mitte) oder 2 (rechts/unten).
+    pub fn grid(self) -> (u8, u8) {
+        let i = Self::ALL.iter().position(|p| *p == self).unwrap_or(4) as u8;
+        (i % 3, i / 3)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Position::TopLeft => "top-left",
+            Position::Top => "top",
+            Position::TopRight => "top-right",
+            Position::Left => "left",
+            Position::Center => "center",
+            Position::Right => "right",
+            Position::BottomLeft => "bottom-left",
+            Position::Bottom => "bottom",
+            Position::BottomRight => "bottom-right",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Position::TopLeft => "Oben links",
+            Position::Top => "Oben Mitte",
+            Position::TopRight => "Oben rechts",
+            Position::Left => "Mitte links",
+            Position::Center => "Mitte Mitte",
+            Position::Right => "Mitte rechts",
+            Position::BottomLeft => "Unten links",
+            Position::Bottom => "Unten Mitte",
+            Position::BottomRight => "Unten rechts",
+        }
+    }
+}
+
+impl Default for Widgets {
+    fn default() -> Self {
+        Self { monitor: MonitorSel::Primary, scale: 1.0, clock: ClockWidget::default(), flight_control: FlightControlWidget::default() }
+    }
+}
+
+impl Default for ClockWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::Center, seconds: false, date: true }
+    }
+}
+
+impl Default for FlightControlWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::BottomLeft }
+    }
+}
+
+impl Widgets {
+    pub fn any_enabled(&self) -> bool {
+        self.clock.enabled || self.flight_control.enabled
+    }
+
+    /// Zeigt dieser Monitor die Widgets? (`index` ab 0)
+    pub fn on_monitor(&self, index: usize, primary: bool) -> bool {
+        match self.monitor {
+            MonitorSel::All => true,
+            MonitorSel::Primary => primary,
+            MonitorSel::Index(n) => n == index + 1,
+        }
+    }
 }
 
 /// Dateiendungen, die als Video gelten (Bibliothek, Drag & Drop).
@@ -172,7 +299,13 @@ impl Default for Wallpaper {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { general: General::default(), audio: Audio::default(), library: Library::default(), wallpapers: vec![Wallpaper::default()] }
+        Self {
+            general: General::default(),
+            audio: Audio::default(),
+            library: Library::default(),
+            widgets: Widgets::default(),
+            wallpapers: vec![Wallpaper::default()],
+        }
     }
 }
 
@@ -218,6 +351,7 @@ impl Config {
         self.general.max_fps = self.general.max_fps.clamp(1, 240);
         self.audio.sensitivity = self.audio.sensitivity.clamp(0.1, 5.0);
         self.audio.smoothing = self.audio.smoothing.clamp(0.0, 0.95);
+        self.widgets.scale = self.widgets.scale.clamp(0.5, 2.0);
         for w in &mut self.wallpapers {
             w.intensity = w.intensity.clamp(0.0, 3.0);
         }
@@ -393,6 +527,14 @@ fn toml_path(p: &Path) -> String {
     }
 }
 
+fn monitor_toml(m: &MonitorSel) -> String {
+    match m {
+        MonitorSel::All => "\"all\"".to_string(),
+        MonitorSel::Primary => "\"primary\"".to_string(),
+        MonitorSel::Index(i) => i.to_string(),
+    }
+}
+
 /// Konfiguration als kommentiertes TOML (Vorlage beim ersten Start, Speichern aus dem Einstellungsfenster).
 pub fn render(cfg: &Config) -> String {
     let mut o = String::new();
@@ -428,17 +570,29 @@ pub fn render(cfg: &Config) -> String {
     line("[library]".into(), "");
     line(format!("folder = {}", toml_path(&cfg.library.folder)), "Ordner mit Videos zur Auswahl (leer = \"Videos\")");
     line(String::new(), "");
+    let wd = &cfg.widgets;
+    line("# Einblendungen über dem Video. Mehrere Widgets an derselben Position werden untereinander gestapelt.".into(), "");
+    line("# position = \"top-left\", \"top\", \"top-right\", \"left\", \"center\", \"right\", \"bottom-left\", \"bottom\", \"bottom-right\"".into(), "");
+    line("[widgets]".into(), "");
+    line(format!("monitor = {}", monitor_toml(&wd.monitor)), "\"all\", \"primary\" oder 1, 2, 3 …");
+    line(format!("scale = {:?}", wd.scale), "Größe 0.5 – 2.0");
+    line(String::new(), "");
+    line("[widgets.clock]".into(), "");
+    line(format!("enabled = {}", wd.clock.enabled), "Uhrzeit anzeigen");
+    line(format!("position = \"{}\"", wd.clock.position.as_str()), "");
+    line(format!("seconds = {}", wd.clock.seconds), "Sekunden anzeigen");
+    line(format!("date = {}", wd.clock.date), "Datum unter der Uhrzeit");
+    line(String::new(), "");
+    line("[widgets.flight_control]".into(), "");
+    line(format!("enabled = {}", wd.flight_control.enabled), "Nächster Raketenstart (lädt alle 15 min Daten von ll.thespacedevs.com)");
+    line(format!("position = \"{}\"", wd.flight_control.position.as_str()), "");
+    line(String::new(), "");
     line("# Ein Block pro Wallpaper. monitor = \"all\", \"primary\" oder 1, 2, 3 … (von links nach rechts).".into(), "");
     line("# Ein spezifischer Eintrag (Nummer) hat Vorrang vor \"primary\", das wiederum vor \"all\".".into(), "");
     line("# video = '' lässt den Monitor beim normalen Windows-Hintergrund.".into(), "");
     for w in &cfg.wallpapers {
-        let monitor = match &w.monitor {
-            MonitorSel::All => "\"all\"".to_string(),
-            MonitorSel::Primary => "\"primary\"".to_string(),
-            MonitorSel::Index(i) => i.to_string(),
-        };
         line("[[wallpaper]]".into(), "");
-        line(format!("monitor = {monitor}"), "");
+        line(format!("monitor = {}", monitor_toml(&w.monitor)), "");
         line(format!("video = {}", toml_path(&w.video)), "");
         line(format!("fit = \"{}\"", w.fit.as_str()), "\"cover\", \"contain\" oder \"stretch\"");
         line(format!("effect = \"{}\"", w.effect.as_str()), "\"none\", \"pulse\", \"glow\" oder \"chroma\" (audio-reaktiv)");
@@ -505,6 +659,10 @@ mod tests {
         cfg.general.autostart = true;
         cfg.audio.smoothing = 0.75;
         cfg.library.folder = PathBuf::from(r"D:\Wall'paper");
+        cfg.widgets.monitor = MonitorSel::Index(2);
+        cfg.widgets.scale = 1.25;
+        cfg.widgets.clock = ClockWidget { enabled: true, position: Position::Top, seconds: true, date: false };
+        cfg.widgets.flight_control = FlightControlWidget { enabled: true, position: Position::BottomRight };
         cfg.wallpapers = vec![
             Wallpaper { video: PathBuf::from(r"C:\Videos\a b.mp4"), ..Default::default() },
             Wallpaper { monitor: MonitorSel::Index(2), video: PathBuf::new(), fit: Fit::Contain, effect: Effect::Glow, intensity: 2.5 },
@@ -519,6 +677,16 @@ mod tests {
         let cfg: Config = toml::from_str("[general]\nautostart = true\n[[wallpaper]]\nvideo = 'a.mp4'\n").unwrap();
         assert!(cfg.general.pause_on_display_off);
         assert!(cfg.library.folder.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn widget_positions() {
+        let cfg: Config = toml::from_str("[widgets.flight_control]\nenabled = true\nposition = 'top-right'\n").unwrap();
+        assert_eq!(cfg.widgets.flight_control.position, Position::TopRight);
+        assert_eq!(cfg.widgets.clock.position, Position::Center);
+        assert_eq!(Position::BottomLeft.grid(), (0, 2));
+        assert_eq!(Position::Center.grid(), (1, 1));
+        assert!(toml::from_str::<Config>("[widgets.clock]\nposition = 'irgendwo'\n").is_err());
     }
 
     #[test]

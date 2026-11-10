@@ -12,8 +12,8 @@
 |---|---|
 | Eingebetteter Chromium (CEF) für Web-Wallpaper: ~100–300 MB RAM pro Instanz, großer Angriffsvektor | Kein Browser. Nur Videodateien. |
 | JavaScript/„SceneScript“ aus dem Workshop führt fremden Code aus | Kein Skripting, keine Plugins, keine Workshop-Downloads |
-| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein einziger Netzwerkaufruf im Code |
-| Große Codebasis, viele Drittbibliotheken | ~3.800 Zeilen Rust (inkl. Kommentare/Tests), 9 direkte Abhängigkeiten |
+| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahme: Flight Control (eine feste HTTPS-Adresse, nur lesend) |
+| Große Codebasis, viele Drittbibliotheken | ~6.000 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
 | Rendert oft dauerhaft mit voller Bildrate | Zeichnet nur, wenn ein neues Videobild fällig ist |
 
 ## Aufbau
@@ -23,8 +23,9 @@
 config.toml ──► │ App (app.rs)                                                       │
                 │  ├─ Nachrichtenschleife: schläft per MsgWaitForMultipleObjects     │
                 │  ├─ Pause-Logik (alle 500 ms)                                      │
-                │  ├─ Gpu (render.rs, wgpu/DX12) ── 1 Gerät, 1 Pipeline              │
+                │  ├─ Gpu (render.rs, wgpu/DX12) ── 1 Gerät, Video- + Widget-Pipeline│
                 │  │    └─ Target pro Monitor (Fenster-Oberfläche)                   │
+                │  ├─ Widgets (overlay/): Text → Bild, max. 1×/s, nur bei Änderung   │
                 │  └─ Player pro Videodatei (video/mod.rs: Uhr + Bildauswahl)        │
                 └──────────▲───────────────────────────────▲─────────────────────────┘
                            │ NV12-Bilder (max. 3 gepuffert) │ Pegel bass/mid/high/level
@@ -55,6 +56,13 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `audio/wasapi.rs` | System-Loopback | **ja** (Windows) |
 | `platform/windows.rs` | Desktop-Einbettung + Wächter, Monitore, Tray, Autostart, Pause-Signale, Dateidialoge | **ja** |
 | `settings.rs` | Einstellungsfenster (egui), Vorschaubilder über `video/mf.rs` | **ja** (Windows) |
+| `overlay/mod.rs` + `overlay.wgsl` | Widgets: Inhalt bestimmen, platzieren (Arbeitsbereich ohne Taskleiste), pixelgenau überblenden | nein |
+| `overlay/text.rs` | Orbitron (eingebettet) mit `ab_glyph` rastern, gleich breite Ziffern, weicher Schatten | nein |
+| `overlay/launch.rs` | Flight Control: Launch Library 2 abfragen, zwischenspeichern, nächsten Start wählen | nein (HTTPS über `platform::sys`) |
+
+**Widgets** kosten fast nichts: Der Inhalt wird höchstens einmal pro Sekunde bestimmt und nur bei einer Änderung
+neu gerastert (Uhr ohne Sekunden: einmal pro Minute). Das fertige Bild liegt als kleine Textur auf der GPU und wird
+im selben Render-Durchlauf wie das Video mit einem Rechteck überblendet. Pausierte Monitore aktualisieren nichts.
 
 ## Desktop-Einbettung (Windows)
 
@@ -112,12 +120,19 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
 - **Keine Codeausführung aus Inhalten**: Es werden ausschließlich Videodateien gelesen. Kein HTML, JS, Lua, Shader-Upload.
 - **Parser = Windows-Komponente**: Container/Codecs parst Media Foundation, das Microsoft per Windows Update patcht.
   Veyra selbst enthält keinen Medienparser.
-- **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. (Prüfbar: `grep -ri "http\|socket" src/`.)
-  `MFSTARTUP_NOSOCKET` verhindert zusätzlich, dass Media Foundation Netzwerkquellen öffnet.
+- **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. `MFSTARTUP_NOSOCKET` verhindert zusätzlich,
+  dass Media Foundation Netzwerkquellen öffnet.
+  **Einzige Ausnahme: Flight Control** (standardmäßig aus). Nur solange das Widget aktiv ist, läuft ein Thread, der
+  alle 15 Minuten *eine* fest eingebaute Adresse abfragt (`https://ll.thespacedevs.com/2.3.0/launches/upcoming/…`).
+  Umsetzung über WinHTTP aus Windows (Systemproxy, Zertifikatsprüfung von Windows, keine eigene TLS-Bibliothek),
+  nur `GET`, Antwort auf 4 MB begrenzt, als JSON gelesen und nur in Textfelder übernommen – nie ausgeführt.
+  Gesendet wird nur die Anfrage mit `User-Agent: Veyra/<Version>`. Prüfbar: `grep -rn "https_get" src/` hat genau
+  einen Aufrufer (`overlay/launch.rs`).
 - **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra`, `HKCU\…\Run` (Autostart) und – nur wenn in den
   Einstellungen aktiviert – eine Verknüpfung ins eigene Startmenü (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`).
 - **Speichersicher**: Rust; `unsafe` nur an den Grenzen zu Win32/COM, jeweils gekapselt.
-- **Wenige Abhängigkeiten**: `wgpu`, `windows`, `rustfft`, `serde`, `toml`, `anyhow`, `log`, `pollster` –
+- **Wenige Abhängigkeiten**: `wgpu`, `windows`, `rustfft`, `serde`, `toml`, `anyhow`, `log`, `pollster`,
+  `ab_glyph` (Schrift-Rasterung, reines Rust), `serde_json` (nur Flight Control) –
   plus `eframe`/egui (nur für das Einstellungsfenster, ohne Netzwerk-/Link-Features).
   Alle weit verbreitet und aktiv gepflegt. `cargo audit` regelmäßig ausführen.
 - **Audio bleibt lokal**: Der Loopback-Pegel wird nur in 4 Zahlen zerlegt; nichts wird gespeichert oder versendet.
@@ -129,7 +144,8 @@ sodass selbst eine Codec-Lücke keinen Zugriff auf Benutzerdaten hätte.
 
 ## Linux-Pfad
 
-Plattformunabhängig (läuft unverändert): Konfiguration, Renderer (wgpu → Vulkan), Shader, Wiedergabe-Uhr, Audio-Analyse.
+Plattformunabhängig (läuft unverändert): Konfiguration, Renderer (wgpu → Vulkan), Shader, Wiedergabe-Uhr, Audio-Analyse,
+Widgets (nur Ortszeit und HTTPS-Abruf kommen aus `platform::sys`).
 
 Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
 

@@ -25,6 +25,9 @@ struct Dev {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
+    /// Widgets: fertige Bilder mit Alpha über das Video blenden.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_layout: wgpu::BindGroupLayout,
     /// DX12 mit NV12-Texturen → geteilte Texturen des Dekoders direkt lesbar (Zero-Copy).
     nv12: bool,
 }
@@ -87,6 +90,14 @@ pub struct Target {
     uniforms: wgpu::Buffer,
     /// Bind Groups je Textur(-Slot); beim Zero-Copy-Ring wechseln sie jedes Bild, daher ein kleiner Cache.
     binds: Vec<(u64, wgpu::BindGroup)>,
+}
+
+/// Ein Widget-Bild auf einer Oberfläche (Textur mit vormultipliziertem Alpha plus Position).
+pub struct Overlay {
+    texture: wgpu::Texture,
+    uniforms: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
 }
 
 pub struct DrawParams {
@@ -225,7 +236,67 @@ impl Dev {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Ok(Self { adapter, device, queue, pipeline, layout, sampler, format, nv12 })
+
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("veyra-overlay"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
+        });
+        let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let overlay_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&overlay_layout)],
+            ..Default::default()
+        });
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("veyra-overlay"),
+            layout: Some(&overlay_pl),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Ok(Self { adapter, device, queue, pipeline, layout, sampler, format, overlay_pipeline, overlay_layout, nv12 })
     }
 }
 
@@ -450,7 +521,55 @@ impl Dev {
 }
 
 impl Gpu {
-    pub fn render(&self, target: &mut Target, tex: &VideoTex, p: &DrawParams) {
+    /// Widget-Bild (RGBA, vormultipliziert) für `target` hochladen; die Textur wird wiederverwendet,
+    /// solange die Größe gleich bleibt.
+    pub fn overlay(&self, current: Option<Overlay>, target: &Target, size: (u32, u32), rgba: &[u8], at: (i32, i32)) -> Overlay {
+        let d = self.dev();
+        let ((width, height), (x, y)) = (size, at);
+        let ov = match current {
+            Some(o) if o.size == (width, height) => o,
+            _ => {
+                let texture = d.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("veyra-widget"),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let uniforms = d.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 32,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let view = texture.create_view(&Default::default());
+                let bind = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &d.overlay_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    ],
+                });
+                Overlay { texture, uniforms, bind, size: (width, height) }
+            }
+        };
+        d.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &ov.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let u: [f32; 8] = [x as f32, y as f32, width as f32, height as f32, target.config.width as f32, target.config.height as f32, 0.0, 0.0];
+        let bytes: Vec<u8> = u.iter().flat_map(|v| v.to_le_bytes()).collect();
+        d.queue.write_buffer(&ov.uniforms, 0, &bytes);
+        ov
+    }
+
+    pub fn render<'a>(&self, target: &mut Target, tex: &VideoTex, p: &DrawParams, overlays: impl IntoIterator<Item = &'a Overlay>) {
         let d = self.dev();
         let Some((y_view, uv_view, generation)) = tex.views() else { return };
         let bind = match target.binds.iter().position(|(g, _)| *g == generation) {
@@ -526,6 +645,14 @@ impl Gpu {
             pass.set_pipeline(&d.pipeline);
             pass.set_bind_group(0, &target.binds[bind].1, &[]);
             pass.draw(0..3, 0..1);
+            let mut overlays = overlays.into_iter().peekable();
+            if overlays.peek().is_some() {
+                pass.set_pipeline(&d.overlay_pipeline);
+                for o in overlays {
+                    pass.set_bind_group(0, &o.bind, &[]);
+                    pass.draw(0..4, 0..1);
+                }
+            }
         }
         // Zero-Copy: nach diesem Zeichnen darf der Dekoder den Slot wieder überschreiben.
         #[cfg(windows)]

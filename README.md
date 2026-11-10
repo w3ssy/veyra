@@ -5,7 +5,7 @@
 **Motion for your universe.**
 
 Schlanke, sichere Video-Hintergründe für den Windows-Desktop.<br>
-Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleunigt hinter deinen Desktop-Symbolen.
+Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschleunigt hinter deinen Desktop-Symbolen.
 
 ![Plattform](https://img.shields.io/badge/Plattform-Windows%2010%20%7C%2011-0078D6?logo=windows)
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?logo=rust)
@@ -29,10 +29,16 @@ Kein Browser, keine Skripte, kein Netzwerk – nur dein Video, hardwarebeschleun
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
-- 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk, keine Adminrechte
+- 🕐 **Widgets** – Uhr und **Flight Control** (Countdown zum nächsten Raketenstart weltweit) über dem Video,
+  in der Raumfahrt-Schrift Orbitron, jedes Widget an einer von 9 Positionen
+- 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk¹, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
 Linux ist architektonisch vorbereitet (siehe [docs/ARCHITEKTUR.md](docs/ARCHITEKTUR.md)).
+
+¹ Einzige Ausnahme: das Widget *Flight Control* – standardmäßig aus. Ist es aktiv, fragt Veyra alle 15 Minuten
+die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi) ab (eine fest eingebaute
+HTTPS-Adresse, nur lesend). Ohne Flight Control gibt es keinen einzigen Netzwerkaufruf.
 
 ## Warum Veyra?
 
@@ -44,8 +50,8 @@ Videos effizient als Hintergrund abspielen.
 |---|---|
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
-| Netzwerk | Kein einziger Netzwerkaufruf im Code |
-| Codebasis | ~4.500 Zeilen Rust, 9 direkte Abhängigkeiten |
+| Netzwerk | Keiner – außer du schaltest Flight Control ein (dann eine einzige, fest eingebaute Adresse) |
+| Codebasis | ~6.000 Zeilen Rust, 11 direkte Abhängigkeiten |
 | Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist, Bilder verlassen nie den Grafikspeicher – und pausiert, wenn niemand hinsieht |
 
 ## Download
@@ -80,6 +86,7 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
    - oben deine Monitore in ihrer echten Anordnung, mit Vorschau des jeweiligen Videos,
    - „Ein Video für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video zu geben,
    - Video per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
+   - unter **Widgets**: Uhr und Flight Control einschalten und per Klick auf den Mini-Monitor platzieren,
    - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
 3. **Speichern** (oder Strg+S) – Veyra übernimmt die Änderung sofort.
 
@@ -94,6 +101,18 @@ Wer lieber eine Textdatei bearbeitet: Tray → **config.toml bearbeiten…** öf
 ```toml
 [library]
 folder = 'D:\Wallpaper'  # Ordner für die Bibliothek im Einstellungsfenster (leer = "Videos")
+
+[widgets]
+monitor = "primary"      # Widgets auf dem Hauptmonitor ("all" oder Nummer geht auch)
+scale = 1.0
+
+[widgets.clock]
+enabled = true
+position = "center"      # top-left, top, top-right, left, center, right, bottom-left, bottom, bottom-right
+
+[widgets.flight_control]
+enabled = true
+position = "bottom-left"
 
 [[wallpaper]]
 monitor = "all"
@@ -150,3 +169,7 @@ und `cargo test` ausführen (so prüft auch die CI).
 ## Lizenz
 
 [MIT](LICENSE) © w3ssy
+
+Eingebettete Schrift: [Orbitron](https://github.com/theleagueof/orbitron) © The Orbitron Project Authors,
+[SIL Open Font License 1.1](assets/Orbitron-OFL.txt).
+Startdaten: [Launch Library 2](https://thespacedevs.com/llapi) von The Space Devs.

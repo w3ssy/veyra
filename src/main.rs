@@ -20,6 +20,8 @@ mod video;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
 mod platform;
 #[cfg(windows)]
 mod settings;

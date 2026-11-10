@@ -3,7 +3,7 @@
 //! Es liest und schreibt ausschließlich `config.toml` – der Hintergrund-Prozess erkennt die Änderung
 //! und übernimmt sie. Ist das Fenster zu, kostet es nichts; stürzt es ab, läuft das Wallpaper weiter.
 
-use crate::config::{self, Backend, Config, Effect, Fit, GpuPreference, MonitorSel, Wallpaper};
+use crate::config::{self, Backend, Config, Effect, Fit, GpuPreference, MonitorSel, Position, Wallpaper};
 use crate::platform::sys::{self, Monitor};
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2};
@@ -149,6 +149,7 @@ fn paint_cover(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Wallpaper,
+    Widgets,
     General,
 }
 
@@ -334,6 +335,98 @@ fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+// ───────────────────────────── Widgets ─────────────────────────────
+
+/// Karte für ein Widget: links die Position auf einem Mini-Monitor, rechts Titel, Schalter und Optionen.
+fn widget_card(
+    ui: &mut egui::Ui,
+    id: &str,
+    enabled: &mut bool,
+    pos: &mut Position,
+    other: Option<Position>,
+    head: impl FnOnce(&mut egui::Ui, &mut bool),
+    options: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(0x1B, 0x1A, 0x29))
+        .stroke(Stroke::new(1.0, if *enabled { ACCENT } else { Color32::from_gray(50) }))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.add_enabled_ui(*enabled, |ui| position_picker(ui, id, pos, other));
+                    ui.label(RichText::new(pos.label()).color(if *enabled { CYAN } else { Color32::GRAY }));
+                });
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    head(ui, enabled);
+                    ui.add_enabled_ui(*enabled, options);
+                });
+            });
+        });
+}
+
+/// Mini-Monitor mit 3 × 3 Plätzen; Klick wählt den Platz. `other` = Platz eines anderen Widgets (grau).
+fn position_picker(ui: &mut egui::Ui, id: &str, pos: &mut Position, other: Option<Position>) {
+    let size = Vec2::new(176.0, 99.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_text(format!("Position wählen ({id})"));
+    let enabled = ui.is_enabled();
+    let painter = ui.painter_at(rect.expand(2.0));
+    painter.rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(0x0E, 0x0D, 0x16));
+    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, Color32::from_gray(70)), StrokeKind::Inside);
+    // Angedeutete Taskleiste – Widgets bleiben immer darüber.
+    let bar = Rect::from_min_max(Pos2::new(rect.min.x + 1.0, rect.max.y - 9.0), Pos2::new(rect.max.x - 1.0, rect.max.y - 1.0));
+    painter.rect_filled(bar, CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 }, Color32::from_gray(40));
+    let area = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, bar.min.y));
+
+    let cell = |p: Position| {
+        let (c, r) = p.grid();
+        let third = Vec2::new(area.width() / 3.0, area.height() / 3.0);
+        Rect::from_min_size(area.min + Vec2::new(third.x * c as f32, third.y * r as f32), third)
+    };
+    let marker = |p: Position| {
+        let (c, r) = p.grid();
+        let m = Vec2::new(40.0, 14.0);
+        let inset = 8.0;
+        let x = match c {
+            0 => area.min.x + inset,
+            1 => area.center().x - m.x / 2.0,
+            _ => area.max.x - inset - m.x,
+        };
+        let y = match r {
+            0 => area.min.y + inset,
+            1 => area.center().y - m.y / 2.0,
+            _ => area.max.y - inset - m.y,
+        };
+        Rect::from_min_size(Pos2::new(x, y), m)
+    };
+
+    let hover = resp.hover_pos().filter(|_| enabled);
+    for p in Position::ALL {
+        let m = marker(p);
+        let hovered = hover.is_some_and(|h| cell(p).contains(h));
+        if p == *pos {
+            painter.rect_filled(m, CornerRadius::same(3), if enabled { ACCENT } else { Color32::from_gray(90) });
+        } else if Some(p) == other {
+            painter.rect_filled(m, CornerRadius::same(3), Color32::from_gray(60));
+        } else {
+            let stroke = if hovered { Stroke::new(1.5, CYAN) } else { Stroke::new(1.0, Color32::from_gray(55)) };
+            painter.rect_stroke(m, CornerRadius::same(3), stroke, StrokeKind::Inside);
+        }
+    }
+    if hover.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos().and_then(|h| Position::ALL.into_iter().find(|p| cell(*p).contains(h))) {
+            *pos = p;
+        }
+    }
+}
+
 // ───────────────────────────── Oberfläche ─────────────────────────────
 
 impl eframe::App for Settings {
@@ -365,6 +458,7 @@ impl eframe::App for Settings {
                 ui.label(RichText::new("Motion for your universe.").size(14.0).color(CYAN));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.tab, Tab::General, RichText::new("Allgemein").size(15.0));
+                    ui.selectable_value(&mut self.tab, Tab::Widgets, RichText::new("Widgets").size(15.0));
                     ui.selectable_value(&mut self.tab, Tab::Wallpaper, RichText::new("Wallpaper").size(15.0));
                 });
             });
@@ -408,6 +502,7 @@ impl eframe::App for Settings {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(0x14, 0x13, 0x1F)).inner_margin(egui::Margin::same(18))).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Wallpaper => self.wallpaper_tab(ui),
+                Tab::Widgets => self.widgets_tab(ui),
                 Tab::General => self.general_tab(ui),
             });
         });
@@ -643,6 +738,79 @@ impl Settings {
         if let Some(v) = chosen {
             self.current().video = v;
         }
+    }
+
+    fn widgets_tab(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "Widgets");
+        ui.label(
+            RichText::new("Einblendungen über dem Video, gesetzt in Orbitron. Jedes Widget bekommt seinen eigenen Platz – teilen sich zwei denselben, stehen sie untereinander.")
+                .color(Color32::GRAY),
+        );
+        ui.add_space(8.0);
+
+        // Läuft auf den gewählten Monitoren überhaupt ein Video? Sonst gibt es nichts, worüber die Widgets liegen.
+        let shows_video = (0..self.monitors.len())
+            .any(|i| self.cfg.widgets.on_monitor(i, self.monitors[i].primary) && !self.video_for(i).as_os_str().is_empty());
+        let monitor_count = self.monitors.len();
+        let wd = &mut self.cfg.widgets;
+        egui::Grid::new("widgets").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+            ui.label("Monitor");
+            let label = |m: &MonitorSel| match m {
+                MonitorSel::Primary => "Hauptmonitor".to_string(),
+                MonitorSel::All => "Alle Monitore".to_string(),
+                MonitorSel::Index(i) => format!("Monitor {i}"),
+            };
+            egui::ComboBox::from_id_salt("widget_monitor").width(260.0).selected_text(label(&wd.monitor)).show_ui(ui, |ui| {
+                ui.selectable_value(&mut wd.monitor, MonitorSel::Primary, label(&MonitorSel::Primary));
+                ui.selectable_value(&mut wd.monitor, MonitorSel::All, label(&MonitorSel::All));
+                for i in 1..=monitor_count {
+                    ui.selectable_value(&mut wd.monitor, MonitorSel::Index(i), label(&MonitorSel::Index(i)));
+                }
+            });
+            ui.end_row();
+            ui.label("Größe");
+            ui.add(egui::Slider::new(&mut wd.scale, 0.5..=2.0).step_by(0.05)).on_hover_text("1.0 = Standard; wächst automatisch mit der Monitorauflösung");
+            ui.end_row();
+        });
+        if wd.any_enabled() && !shows_video {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Auf diesem Monitor läuft kein Video – Widgets erscheinen nur über einem Video-Wallpaper.")
+                    .color(Color32::from_rgb(0xF5, 0x9E, 0x0B)),
+            );
+        }
+
+        let (clock_pos, fc_pos) = (wd.clock.position, wd.flight_control.position);
+        let (clock_on, fc_on) = (wd.clock.enabled, wd.flight_control.enabled);
+
+        ui.add_space(14.0);
+        widget_card(ui, "clock", &mut wd.clock.enabled, &mut wd.clock.position, fc_on.then_some(fc_pos), |ui, enabled| {
+            ui.label(RichText::new("Uhr").size(17.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new("Uhrzeit groß, darunter das Datum.").color(Color32::GRAY));
+            ui.add_space(4.0);
+            ui.checkbox(enabled, "Aktiv");
+        }, |ui| {
+            ui.checkbox(&mut wd.clock.seconds, "Sekunden anzeigen");
+            ui.checkbox(&mut wd.clock.date, "Datum anzeigen");
+        });
+
+        ui.add_space(12.0);
+        widget_card(ui, "flight", &mut wd.flight_control.enabled, &mut wd.flight_control.position, clock_on.then_some(clock_pos), |ui, enabled| {
+            ui.label(RichText::new("Flight Control").size(17.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new("Der nächste Raketenstart weltweit: Countdown, Status, Rakete, Mission und Startplatz.").color(Color32::GRAY));
+            ui.add_space(4.0);
+            ui.checkbox(enabled, "Aktiv");
+        }, |ui| {
+            ui.label(
+                RichText::new(
+                    "Einzige Funktion mit Internetzugriff: lädt alle 15 Minuten öffentliche Startdaten von ll.thespacedevs.com \
+                     (Launch Library 2 von The Space Devs). Gesendet wird nur die Anfrage selbst; ist das Widget aus, \
+                     gibt es keinen Netzwerkzugriff.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
     }
 
     fn general_tab(&mut self, ui: &mut egui::Ui) {

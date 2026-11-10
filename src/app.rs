@@ -2,9 +2,10 @@
 //! wann überhaupt gerechnet wird. Grundsatz: Nichts tun, wenn es niemand sieht.
 
 use crate::audio::{AudioCapture, Levels, SharedLevels};
-use crate::config::{self, Config, Effect, Wallpaper};
+use crate::config::{self, Config, Effect, Position, Wallpaper};
+use crate::overlay::{self, text::Line};
 use crate::platform::sys::{self, DesktopHost, Event, HostState, MenuItem, Monitor, Tray, WallpaperWindow};
-use crate::render::{DrawParams, Gpu, Target, VideoTex};
+use crate::render::{DrawParams, Gpu, Overlay, Target, VideoTex};
 use crate::video::{DecodeOptions, Player};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -35,6 +36,15 @@ struct Slot {
     paused: bool,
     dirty: bool,
     last_render: Instant,
+    /// Widgets auf diesem Monitor, eins pro belegter Position.
+    panels: Vec<Panel>,
+}
+
+struct Panel {
+    pos: Position,
+    /// Inhalt, aus dem das Bild gerastert wurde – unverändert → nichts zu tun.
+    lines: Vec<Line>,
+    overlay: Overlay,
 }
 
 struct PlayerEntry {
@@ -60,6 +70,9 @@ pub struct App {
     monitors: Vec<Monitor>,
     levels: SharedLevels,
     audio: Option<AudioCapture>,
+    widgets: overlay::Widgets,
+    /// Sekunde (Unix-Zeit), für die die Widgets zuletzt bestimmt wurden.
+    widget_second: i64,
     manual_pause: bool,
     locked: bool,
     display_off: bool,
@@ -92,6 +105,8 @@ pub fn run(autostart: bool) -> Result<()> {
     let cfg_path = config::config_path();
     let cfg = Config::load_or_create(&cfg_path)?;
     let gpu = Gpu::new(cfg.general.backend, cfg.general.gpu);
+    let mut widgets = overlay::Widgets::new();
+    widgets.configure(&cfg.widgets);
 
     let control = sys::ControlWindow::new()?;
     let tray = Tray::new(&control);
@@ -109,6 +124,8 @@ pub fn run(autostart: bool) -> Result<()> {
         monitors: Vec::new(),
         levels: Default::default(),
         audio: None,
+        widgets,
+        widget_second: 0,
         manual_pause: false,
         locked: false,
         display_off: false,
@@ -249,7 +266,16 @@ impl App {
         let (display, handle) = window.raw_handles();
         // SAFETY: `target` steht in `Slot` vor `window` und wird daher zuerst freigegeben.
         let target = unsafe { self.gpu.create_target(display, handle, window.width, window.height)? };
-        Ok(Slot { target, window, monitor_index, wallpaper, paused: false, dirty: true, last_render: Instant::now() - Duration::from_secs(1) })
+        Ok(Slot {
+            target,
+            window,
+            monitor_index,
+            wallpaper,
+            paused: false,
+            dirty: true,
+            last_render: Instant::now() - Duration::from_secs(1),
+            panels: Vec::new(),
+        })
     }
 
     fn reload_config(&mut self) {
@@ -266,6 +292,14 @@ impl App {
                     self.audio = None; // mit neuen Parametern neu starten
                 }
                 self.apply_autostart();
+                if old.widgets != self.cfg.widgets {
+                    self.widgets.configure(&self.cfg.widgets);
+                    for s in &mut self.slots {
+                        s.panels.clear();
+                        s.dirty = true;
+                    }
+                    self.widget_second = 0; // sofort neu aufbauen
+                }
                 // Fenster nur neu anlegen, wenn sich ändert, welcher Monitor welches Video zeigt.
                 // Darstellung, Effekte, Pausen-Regeln, Autostart … werden direkt übernommen.
                 let wanted = self.wanted();
@@ -421,6 +455,8 @@ impl App {
             self.schedule_rebuild(Duration::ZERO);
         }
 
+        self.update_widgets();
+
         let audio_on = self.audio.is_some();
         let levels = if audio_on { self.levels.lock().map(|l| *l).unwrap_or_default() } else { Levels::default() };
         let interval = Duration::from_secs_f64(1.0 / self.cfg.general.max_fps as f64);
@@ -448,7 +484,7 @@ impl App {
                     levels,
                     time,
                 };
-                self.gpu.render(&mut slot.target, tex, &params);
+                self.gpu.render(&mut slot.target, tex, &params, slot.panels.iter().map(|p| &p.overlay));
                 slot.last_render = now;
                 slot.dirty = false;
             }
@@ -457,9 +493,65 @@ impl App {
         if anything_active {
             // Genau zum nächsten fälligen Bild aufwachen (höchstens `interval`, für Audio-Effekte);
             // liefert der Dekoder gerade nichts, kurz darauf erneut nachsehen.
-            next_frame.unwrap_or(Duration::from_millis(4)).clamp(Duration::from_millis(1), interval)
+            let wake = next_frame.unwrap_or(Duration::from_millis(4)).clamp(Duration::from_millis(1), interval);
+            if self.cfg.widgets.any_enabled() {
+                // Spätestens zum nächsten Sekundenwechsel (Uhr, Countdown).
+                let ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0);
+                wake.min(Duration::from_millis((1000 - ms as u64) + 2))
+            } else {
+                wake
+            }
         } else {
             IDLE_WAKE
+        }
+    }
+
+    /// Widgets höchstens einmal pro Sekunde neu bestimmen; nur geänderte Positionen neu rastern.
+    fn update_widgets(&mut self) {
+        let cfg = &self.cfg.widgets;
+        if !cfg.any_enabled() {
+            for s in &mut self.slots {
+                if !s.panels.is_empty() {
+                    s.panels.clear();
+                    s.dirty = true;
+                }
+            }
+            return;
+        }
+        let now = overlay::time::now_unix();
+        if now == self.widget_second || self.slots.iter().all(|s| s.paused) {
+            return;
+        }
+        self.widget_second = now;
+        let content = self.widgets.content(cfg, now);
+        for slot in &mut self.slots {
+            if slot.paused {
+                continue;
+            }
+            let monitor = &self.monitors[slot.monitor_index];
+            let before = slot.panels.len();
+            if cfg.on_monitor(slot.monitor_index, monitor.primary) {
+                slot.panels.retain(|p| content.iter().any(|(pos, _)| *pos == p.pos));
+            } else {
+                slot.panels.clear();
+            }
+            slot.dirty |= slot.panels.len() != before;
+            if !cfg.on_monitor(slot.monitor_index, monitor.primary) {
+                continue;
+            }
+            let scale = overlay::scale_for(slot.window.height, cfg);
+            for (pos, lines) in &content {
+                let existing = slot.panels.iter().position(|p| p.pos == *pos);
+                if existing.is_some_and(|i| slot.panels[i].lines == *lines) {
+                    continue;
+                }
+                let img = self.widgets.rasterize(lines, *pos, scale);
+                let (x, y) = overlay::place(*pos, &img, (slot.window.width, slot.window.height), monitor.work_insets, scale);
+                let old = existing.map(|i| slot.panels.remove(i).overlay);
+                let overlay = self.gpu.overlay(old, &slot.target, (img.width, img.height), &img.rgba, (x, y));
+                slot.panels.push(Panel { pos: *pos, lines: lines.clone(), overlay });
+                slot.dirty = true;
+            }
         }
     }
 

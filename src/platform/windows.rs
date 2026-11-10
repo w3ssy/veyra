@@ -338,6 +338,8 @@ pub struct Monitor {
     pub height: i32,
     pub primary: bool,
     pub name: String,
+    /// Abstand des Arbeitsbereichs (ohne Taskleiste) zum Monitorrand: links, oben, rechts, unten.
+    pub work_insets: [i32; 4],
 }
 
 impl Monitor {
@@ -354,6 +356,7 @@ pub fn monitors() -> Vec<Monitor> {
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         if GetMonitorInfoW(hmon, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
             let r = info.monitorInfo.rcMonitor;
+            let w = info.monitorInfo.rcWork;
             let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
             list.push(Monitor {
                 x: r.left,
@@ -362,6 +365,7 @@ pub fn monitors() -> Vec<Monitor> {
                 height: r.bottom - r.top,
                 primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
                 name: String::from_utf16_lossy(&info.szDevice[..len]),
+                work_insets: [w.left - r.left, w.top - r.top, r.right - w.right, r.bottom - w.bottom],
             });
         }
         TRUE
@@ -939,6 +943,98 @@ pub fn system_state(monitors: &[Monitor], own: &[isize]) -> SystemState {
         st.fg_maximized = IsZoomed(fg).as_bool();
     }
     st
+}
+
+// ───────────────────────────── Zeit ─────────────────────────────
+
+/// Ortszeit (Zeitzone und Sommerzeit von Windows) für einen Unix-Zeitpunkt in Sekunden.
+pub fn local_time(unix: i64) -> crate::overlay::time::DateTime {
+    use crate::overlay::time::DateTime;
+    use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+    let utc = DateTime::from_unix(unix);
+    let st = SYSTEMTIME {
+        wYear: utc.year as u16,
+        wMonth: utc.month as u16,
+        wDayOfWeek: utc.weekday as u16,
+        wDay: utc.day as u16,
+        wHour: utc.hour as u16,
+        wMinute: utc.minute as u16,
+        wSecond: utc.second as u16,
+        wMilliseconds: 0,
+    };
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: beide Zeiger zeigen auf gültige Strukturen; None = aktuelle Zeitzone des Systems.
+    if unsafe { SystemTimeToTzSpecificLocalTime(None, &st, &mut local) }.is_err() {
+        return utc;
+    }
+    DateTime::new(local.wYear as i32, local.wMonth as u32, local.wDay as u32, local.wHour as u32, local.wMinute as u32, local.wSecond as u32)
+}
+
+// ───────────────────────────── HTTPS ─────────────────────────────
+
+/// Einfacher HTTPS-GET über WinHTTP (in Windows enthalten: Proxy-Einstellungen und Zertifikatsprüfung
+/// des Systems, keine eigene TLS-Bibliothek). Liefert Statuscode und höchstens `max_bytes` Antwort.
+pub fn https_get(host: &str, path: &str, max_bytes: usize) -> Result<(u16, Vec<u8>)> {
+    use windows::Win32::Networking::WinHttp::*;
+
+    /// Schließt ein WinHTTP-Handle beim Verlassen des Gültigkeitsbereichs.
+    struct H(*mut core::ffi::c_void);
+    impl Drop for H {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: Handle stammt von WinHTTP und wird genau einmal geschlossen.
+                let _ = unsafe { WinHttpCloseHandle(self.0) };
+            }
+        }
+    }
+    let check = |h: *mut core::ffi::c_void, what: &str| -> Result<H> {
+        if h.is_null() {
+            Err(windows::core::Error::from_thread()).context(what.to_string())
+        } else {
+            Ok(H(h))
+        }
+    };
+
+    let agent = HSTRING::from(format!("Veyra/{} (+https://github.com/w3ssy/veyra)", env!("CARGO_PKG_VERSION")));
+    // SAFETY: alle Zeichenketten leben bis zum Ende der Funktion, Handles werden über `H` geschlossen.
+    unsafe {
+        let session = check(WinHttpOpen(&agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0), "WinHttpOpen")?;
+        WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 20_000).context("WinHttpSetTimeouts")?;
+        let connect = check(WinHttpConnect(session.0, &HSTRING::from(host), INTERNET_DEFAULT_HTTPS_PORT, 0), "Verbindung")?;
+        let request = check(
+            WinHttpOpenRequest(connect.0, w!("GET"), &HSTRING::from(path), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE),
+            "Anfrage",
+        )?;
+        WinHttpSendRequest(request.0, None, None, 0, 0, 0).with_context(|| format!("{host} nicht erreichbar"))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).context("keine Antwort")?;
+
+        let mut status = 0u32;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some(&mut status as *mut u32 as *mut _),
+            &mut len,
+            std::ptr::null_mut(),
+        )
+        .context("Statuscode lesen")?;
+
+        let mut body = Vec::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let mut read = 0u32;
+            WinHttpReadData(request.0, buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut read).context("Antwort lesen")?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..read as usize]);
+            if body.len() > max_bytes {
+                bail!("Antwort größer als {max_bytes} Bytes");
+            }
+        }
+        Ok((status as u16, body))
+    }
 }
 
 unsafe fn class_name(hwnd: HWND) -> String {
