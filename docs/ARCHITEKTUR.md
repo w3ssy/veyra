@@ -12,8 +12,8 @@
 |---|---|
 | Eingebetteter Chromium (CEF) für Web-Wallpaper: ~100–300 MB RAM pro Instanz, großer Angriffsvektor | Kein Browser. Nur Videodateien. |
 | JavaScript/„SceneScript“ aus dem Workshop führt fremden Code aus | Kein Skripting, keine Plugins, keine Workshop-Downloads |
-| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahme: Flight Control (eine feste HTTPS-Adresse, nur lesend) |
-| Große Codebasis, viele Drittbibliotheken | ~6.000 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
+| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahme: Flight Control (zwei feste HTTPS-Adressen, nur lesend) |
+| Große Codebasis, viele Drittbibliotheken | ~7.000 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
 | Rendert oft dauerhaft mit voller Bildrate | Zeichnet nur, wenn ein neues Videobild fällig ist |
 
 ## Aufbau
@@ -57,12 +57,16 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `platform/windows.rs` | Desktop-Einbettung + Wächter, Monitore, Tray, Autostart, Pause-Signale, Dateidialoge | **ja** |
 | `settings.rs` | Einstellungsfenster (egui), Vorschaubilder über `video/mf.rs` | **ja** (Windows) |
 | `overlay/mod.rs` + `overlay.wgsl` | Widgets: Inhalt bestimmen, platzieren (Arbeitsbereich ohne Taskleiste), pixelgenau überblenden | nein |
-| `overlay/text.rs` | Orbitron (eingebettet) mit `ab_glyph` rastern, gleich breite Ziffern, weicher Schatten | nein |
-| `overlay/launch.rs` | Flight Control: Launch Library 2 abfragen, zwischenspeichern, nächsten Start wählen | nein (HTTPS über `platform::sys`) |
+| `overlay/canvas.rs` | Zeichenfläche: Ebenen Hintergrund/Vordergrund/Leuchten, kantengeglättete Formen, Schatten | nein |
+| `overlay/text.rs` | Orbitron (eingebettet) mit `ab_glyph` setzen, gleich breite Ziffern | nein |
+| `overlay/flight.rs` | Mission-Control-Modul: Layout, Raketen-Scan (Kantenbild), Patch-Ring, Countdown-Phasen | nein |
+| `overlay/launch.rs` | Flight Control: Launch Library 2 abfragen, Bilder laden, zwischenspeichern, nächsten Start wählen | nein (HTTPS und Bild-Dekodierung über `platform::sys`) |
 
 **Widgets** kosten fast nichts: Der Inhalt wird höchstens einmal pro Sekunde bestimmt und nur bei einer Änderung
 neu gerastert (Uhr ohne Sekunden: einmal pro Minute). Das fertige Bild liegt als kleine Textur auf der GPU und wird
 im selben Render-Durchlauf wie das Video mit einem Rechteck überblendet. Pausierte Monitore aktualisieren nichts.
+Der Countdown-Effekt (Aufleuchten in den letzten 10 Sekunden, Blitz bei T-0) steckt in einer zweiten, gleich großen
+Textur; der Shader mischt sie mit einer Stärke dazu, die pro Bild berechnet wird – nur dann wird jedes Bild gezeichnet.
 
 ## Desktop-Einbettung (Windows)
 
@@ -123,11 +127,17 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
 - **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. `MFSTARTUP_NOSOCKET` verhindert zusätzlich,
   dass Media Foundation Netzwerkquellen öffnet.
   **Einzige Ausnahme: Flight Control** (standardmäßig aus). Nur solange das Widget aktiv ist, läuft ein Thread, der
-  alle 15 Minuten *eine* fest eingebaute Adresse abfragt (`https://ll.thespacedevs.com/2.3.0/launches/upcoming/…`).
+  alle 15 Minuten (in der Stunde vor einem Start alle 6 Minuten) die Liste der nächsten Starts von
+  `https://ll.thespacedevs.com/2.3.0/…` abfragt, einmal pro neuem Start dessen Mission-Patch, und Fotos/Patches der
+  nächsten zwei Starts aus der Bildablage `https://thespacedevs-prod.nyc3.digitaloceanspaces.com/media/…` lädt.
+  Andere Adressen werden abgelehnt, auch wenn sie in den Daten stehen.
   Umsetzung über WinHTTP aus Windows (Systemproxy, Zertifikatsprüfung von Windows, keine eigene TLS-Bibliothek),
-  nur `GET`, Antwort auf 4 MB begrenzt, als JSON gelesen und nur in Textfelder übernommen – nie ausgeführt.
-  Gesendet wird nur die Anfrage mit `User-Agent: Veyra/<Version>`. Prüfbar: `grep -rn "https_get" src/` hat genau
-  einen Aufrufer (`overlay/launch.rs`).
+  nur `GET`, Antworten auf 4 MB (JSON) bzw. 8 MB (Bild) begrenzt. JSON wird nur in Textfelder übernommen – nie
+  ausgeführt. Bilder müssen JPEG oder PNG sein (Signatur geprüft) und werden ausschließlich mit den eingebauten
+  Decodern der Windows Imaging Component gelesen – wie bei den Videos parst also eine von Windows Update gepflegte
+  Komponente, nachinstallierte Codecs kommen nie zum Zug. Zwischenspeicher: `%APPDATA%\Veyra\cache` (nach 14 Tagen
+  ohne Gebrauch gelöscht). Gesendet wird nur die Anfrage mit `User-Agent: Veyra/<Version>`.
+  Prüfbar: `grep -rn "https_get" src/` – aufgerufen wird es nur in `overlay/launch.rs`.
 - **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra`, `HKCU\…\Run` (Autostart) und – nur wenn in den
   Einstellungen aktiviert – eine Verknüpfung ins eigene Startmenü (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`).
 - **Speichersicher**: Rust; `unsafe` nur an den Grenzen zu Win32/COM, jeweils gekapselt.

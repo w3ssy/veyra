@@ -1,24 +1,23 @@
-//! Widgets über dem Video: Uhr und Flight Control (nächster Raketenstart).
+//! Widgets über dem Video: Uhr und Flight Control (nächster Raketenstart als Mission-Control-Modul).
 //!
 //! Der Inhalt wird höchstens einmal pro Sekunde neu bestimmt; gerastert und hochgeladen wird nur,
 //! wenn er sich tatsächlich ändert (die Uhr ohne Sekunden also einmal pro Minute). Pausierte
 //! Monitore kosten nichts – ihre Widgets werden erst beim Fortsetzen aktualisiert.
 
+pub mod canvas;
+pub mod flight;
 pub mod launch;
 pub mod text;
 pub mod time;
 
 use crate::config::{self, Position};
 use crate::platform::sys;
+use canvas::Image;
+use flight::Fx;
 use launch::{Feed, View};
-use text::{Align, Color, Fonts, Image, Line, Weight, WHITE};
-use time::{DateTime, MONTHS, WEEKDAYS, WEEKDAYS_SHORT};
+use text::{Align, Color, Fonts, Line, Weight, WHITE};
+use time::{DateTime, MONTHS, WEEKDAYS};
 
-const CYAN: Color = [0x22, 0xD3, 0xEE, 255];
-const GREEN: Color = [0x34, 0xD3, 0x99, 255];
-const AMBER: Color = [0xF5, 0x9E, 0x0B, 255];
-const RED: Color = [0xF8, 0x71, 0x71, 255];
-const DIM: Color = [255, 255, 255, 170];
 const SOFT: Color = [255, 255, 255, 225];
 
 /// Abstand zum Rand des Arbeitsbereichs bei Skalierung 1.
@@ -26,17 +25,36 @@ const MARGIN: f32 = 48.0;
 /// Abstand zwischen zwei Widgets an derselben Position.
 const STACK_GAP: f32 = 28.0;
 
-/// Inhalt einer Position: die Zeilen aller Widgets, die dort stehen.
-pub type Content = Vec<(Position, Vec<Line>)>;
+/// Ein Widget mit allem, was es gerade zeigt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Widget {
+    Clock(Vec<Line>),
+    Flight(Box<flight::Flight>),
+}
+
+impl Widget {
+    pub fn fx(&self) -> Fx {
+        match self {
+            Widget::Flight(f) => f.fx,
+            Widget::Clock(_) => Fx::None,
+        }
+    }
+}
+
+/// Inhalt je Position (Reihenfolge stabil).
+pub type Content = Vec<(Position, Vec<Widget>)>;
+
+pub use flight::flash;
 
 pub struct Widgets {
     fonts: Fonts,
     feed: Option<Feed>,
+    cache: flight::Cache,
 }
 
 impl Widgets {
     pub fn new() -> Self {
-        Self { fonts: Fonts::new(), feed: None }
+        Self { fonts: Fonts::new(), feed: None, cache: flight::Cache::default() }
     }
 
     /// Datenabruf passend zur Konfiguration starten oder beenden.
@@ -44,7 +62,7 @@ impl Widgets {
         match (cfg.flight_control.enabled, self.feed.is_some()) {
             (true, false) => {
                 log::info!("Flight Control aktiv – lade Startdaten von ll.thespacedevs.com");
-                self.feed = Some(Feed::start(config::config_dir().join("launches.json")));
+                self.feed = Some(Feed::start(config::config_dir()));
             }
             (false, true) => {
                 log::info!("Flight Control aus – kein Netzwerkzugriff mehr");
@@ -54,37 +72,80 @@ impl Widgets {
         }
     }
 
-    /// Was jetzt angezeigt werden soll, gruppiert nach Position (Reihenfolge stabil).
+    /// Was jetzt angezeigt werden soll, gruppiert nach Position.
     pub fn content(&self, cfg: &config::Widgets, now: i64) -> Content {
         let mut out: Content = Vec::new();
-        let mut add = |pos: Position, lines: Vec<Line>| match out.iter_mut().find(|(p, _)| *p == pos) {
-            Some((_, existing)) => {
-                let mut lines = lines;
-                if let Some(first) = lines.first_mut() {
-                    first.gap += STACK_GAP;
-                }
-                existing.extend(lines);
-            }
-            None => out.push((pos, lines)),
+        let mut add = |pos: Position, w: Widget| match out.iter_mut().find(|(p, _)| *p == pos) {
+            Some((_, list)) => list.push(w),
+            None => out.push((pos, vec![w])),
         };
         if cfg.clock.enabled {
-            add(cfg.clock.position, clock(&cfg.clock, sys::local_time(now)));
+            add(cfg.clock.position, Widget::Clock(clock(&cfg.clock, sys::local_time(now))));
         }
         if cfg.flight_control.enabled {
             let view = self.feed.as_ref().map_or(View::Waiting, |f| f.view(now));
-            add(cfg.flight_control.position, flight_control(view, now));
+            add(cfg.flight_control.position, Widget::Flight(Box::new(flight::content(view, now))));
         }
         out
     }
 
-    pub fn rasterize(&self, lines: &[Line], pos: Position, scale: f32) -> Image {
+    /// Alle Widgets einer Position rastern und untereinander stapeln.
+    pub fn rasterize(&mut self, widgets: &[Widget], pos: Position, scale: f32) -> Image {
         let align = match pos.grid().0 {
             0 => Align::Left,
             1 => Align::Center,
             _ => Align::Right,
         };
-        text::render(&self.fonts, lines, align, scale)
+        let images: Vec<Image> = widgets
+            .iter()
+            .map(|w| match w {
+                Widget::Clock(lines) => text::render(&self.fonts, lines, align, scale),
+                Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache),
+            })
+            .collect();
+        stack(images, align, (STACK_GAP * scale).round() as u32)
     }
+}
+
+/// Bilder untereinander setzen (alle mit gleichem Schattenrand, da gleiche Skalierung).
+fn stack(mut images: Vec<Image>, align: Align, gap: u32) -> Image {
+    if images.len() == 1 {
+        return images.pop().unwrap();
+    }
+    let pad = images.iter().map(|i| i.pad).max().unwrap_or(0);
+    let width = images.iter().map(|i| i.width).max().unwrap_or(1);
+    let inner: u32 = images.iter().map(|i| i.height - 2 * i.pad).sum::<u32>() + gap * (images.len() as u32 - 1);
+    let height = inner + 2 * pad;
+    let with_glow = images.iter().any(|i| !i.glow.is_empty());
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let mut glow = if with_glow { vec![0u8; rgba.len()] } else { Vec::new() };
+    let mut y = 0u32;
+    for img in &images {
+        let x = match align {
+            Align::Left => 0,
+            Align::Center => (width - img.width) / 2,
+            Align::Right => width - img.width,
+        };
+        // Pixel "über" das bisherige legen – die Schattenränder benachbarter Bilder dürfen sich überlappen.
+        let over = |dst: &mut [u8], src: &[u8]| {
+            for row in 0..img.height {
+                for col in 0..img.width {
+                    let s = ((row * img.width + col) * 4) as usize;
+                    let d = (((y + row) * width + x + col) * 4) as usize;
+                    let inv = 255 - src[s + 3] as u32;
+                    for k in 0..4 {
+                        dst[d + k] = (src[s + k] as u32 + dst[d + k] as u32 * inv / 255).min(255) as u8;
+                    }
+                }
+            }
+        };
+        over(&mut rgba, &img.rgba);
+        if !img.glow.is_empty() {
+            over(&mut glow, &img.glow);
+        }
+        y += img.height - 2 * img.pad + gap;
+    }
+    Image { width, height, pad, rgba, glow }
 }
 
 /// Skalierung für einen Monitor: 1.0 bei 1080 Pixel Höhe.
@@ -125,93 +186,13 @@ fn clock(cfg: &config::ClockWidget, t: DateTime) -> Vec<Line> {
     lines
 }
 
-fn status_color(status: &str) -> Color {
-    match status {
-        "Go" | "Success" => GREEN,
-        "In Flight" => CYAN,
-        "Hold" | "Failure" | "Partial Failure" => RED,
-        _ => AMBER,
-    }
-}
-
-/// "T- 1D 02:14:37" vor dem Start, "T+ 00:03:12" danach.
-fn countdown(net: i64, now: i64) -> String {
-    let d = net - now;
-    let sign = if d > 0 { "T-" } else { "T+" };
-    let s = d.unsigned_abs();
-    let (days, h, m, sec) = (s / 86_400, s / 3600 % 24, s / 60 % 60, s % 60);
-    if days > 0 {
-        format!("{sign} {days}D {h:02}:{m:02}:{sec:02}")
-    } else {
-        format!("{sign} {h:02}:{m:02}:{sec:02}")
-    }
-}
-
-/// Lange Namen kürzen, damit das Widget nicht über den halben Bildschirm reicht.
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max - 1).collect::<String>().trim_end().to_string() + "…"
-    }
-}
-
-fn flight_control(view: View, now: i64) -> Vec<Line> {
-    let header = |status: Option<(&str, Color)>, live: bool| {
-        let mut l = Line::new(14.0, Weight::Bold).tracking(0.3).span("NEXT LAUNCH", CYAN);
-        if let Some((s, c)) = status {
-            l = l.span(" / ", DIM).span(s.to_uppercase(), c);
-        }
-        if live {
-            l = l.span(" / ", DIM).span("LIVE", RED);
-        }
-        l
-    };
-    let big = |s: String| Line::new(52.0, Weight::Bold).span(s, WHITE).tabular().tracking(0.03).gap(6.0);
-    let small = |s: String, c: Color| Line::new(14.0, Weight::Medium).span(s, c).tracking(0.16).gap(8.0);
-
-    let l = match view {
-        View::Waiting => return vec![header(None, false), big("T- --:--:--".into()), small("AWAITING TELEMETRY".into(), DIM)],
-        View::NoSignal => return vec![header(None, false), big("T- --:--:--".into()), small("NO SIGNAL".into(), RED)],
-        View::Launch(l) => l,
-    };
-    let local = sys::local_time(l.net);
-    let when = format!("{} {}.{}. {}:{}", WEEKDAYS_SHORT[local.weekday as usize], two(local.day), two(local.month), two(local.hour), two(local.minute));
-    let main = if l.precise || l.net <= now {
-        countdown(l.net, now)
-    } else {
-        format!("NET {}. {}", local.day, MONTHS[local.month as usize - 1].chars().take(3).collect::<String>())
-    };
-    let mut mission = format!("{} / {}", l.rocket, clip(&l.mission, 34)).to_uppercase();
-    if !l.orbit.is_empty() {
-        mission += &format!(" / {}", l.orbit.to_uppercase());
-    }
-    let mut site: Vec<String> = [l.pad.as_str(), l.location.as_str()].into_iter().filter(|s| !s.is_empty()).map(|s| clip(s, 32)).collect();
-    if l.precise {
-        site.push(when);
-    }
-    vec![
-        header(Some((&l.status, status_color(&l.status))), l.webcast),
-        big(main),
-        Line::new(19.0, Weight::Bold).span(mission, SOFT).tracking(0.06).gap(6.0),
-        small(site.join(" / ").to_uppercase(), DIM),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn countdown_format() {
-        assert_eq!(countdown(1000 + 2 * 86_400 + 3723, 1000), "T- 2D 01:02:03");
-        assert_eq!(countdown(1000 + 59, 1000), "T- 00:00:59");
-        assert_eq!(countdown(1000, 1000 + 192), "T+ 00:03:12");
-    }
-
-    #[test]
     fn placement_respects_taskbar() {
-        let img = Image { width: 300, height: 120, pad: 14, rgba: Vec::new() };
+        let img = Image { width: 300, height: 120, pad: 14, rgba: Vec::new(), glow: Vec::new() };
         // Taskleiste unten, 48 px hoch
         let (x, y) = place(Position::BottomLeft, &img, (1920, 1080), [0, 0, 0, 48], 1.0);
         assert_eq!(x, 48 - 14);
@@ -222,7 +203,7 @@ mod tests {
 
     #[test]
     fn stacked_widgets_share_a_position() {
-        let w = Widgets::new();
+        let mut w = Widgets::new();
         let mut cfg = config::Widgets::default();
         cfg.clock.enabled = true;
         cfg.flight_control.enabled = true;
@@ -230,8 +211,14 @@ mod tests {
         cfg.flight_control.position = Position::BottomLeft;
         let c = w.content(&cfg, time::now_unix());
         assert_eq!(c.len(), 1);
-        assert!(c[0].1.len() >= 5);
+        assert_eq!(c[0].1.len(), 2);
+        let both = w.rasterize(&c[0].1, Position::BottomLeft, 1.0);
+        let single = w.rasterize(&c[0].1[1..], Position::BottomLeft, 1.0);
+        assert!(both.height > single.height + 80);
+        assert_eq!(both.rgba.len(), (both.width * both.height * 4) as usize);
         cfg.clock.position = Position::Center;
         assert_eq!(w.content(&cfg, time::now_unix()).len(), 2);
     }
 }
+
+

@@ -970,6 +970,54 @@ pub fn local_time(unix: i64) -> crate::overlay::time::DateTime {
     DateTime::new(local.wYear as i32, local.wMonth as u32, local.wDay as u32, local.wHour as u32, local.wMinute as u32, local.wSecond as u32)
 }
 
+// ───────────────────────────── Bilder ─────────────────────────────
+
+/// JPEG oder PNG aus dem Speicher dekodieren (Windows Imaging Component, also wie bei den Videos ein
+/// von Windows Update gepflegter Parser). Andere Formate werden abgelehnt, und es werden ausdrücklich die
+/// eingebauten Decoder gewählt – nachinstallierte Codecs kommen nie zum Zug.
+/// Liefert Breite, Höhe und RGBA mit vormultipliziertem Alpha, verkleinert auf höchstens `max_side`.
+pub fn decode_image(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+
+    let container = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        GUID_ContainerFormatJpeg
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        GUID_ContainerFormatPng
+    } else {
+        bail!("weder JPEG noch PNG");
+    };
+    // SAFETY: COM-Aufrufe mit gültigen Zeigern; `bytes` lebt länger als der Stream.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
+        let stream = factory.CreateStream()?;
+        stream.InitializeFromMemory(bytes)?;
+        let decoder = factory.CreateDecoder(&container, &GUID_VendorMicrosoftBuiltIn)?;
+        decoder.Initialize(&stream, WICDecodeMetadataCacheOnDemand).context("Bild lesen")?;
+        let frame = decoder.GetFrame(0)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        if w == 0 || h == 0 || w > 16_384 || h > 16_384 {
+            bail!("unplausible Bildgröße {w}x{h}");
+        }
+        let k = (max_side as f32 / w.max(h) as f32).min(1.0);
+        let (tw, th) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+        let source: IWICBitmapSource = if (tw, th) != (w, h) {
+            let scaler = factory.CreateBitmapScaler()?;
+            scaler.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant)?;
+            scaler.cast()?
+        } else {
+            frame.cast()?
+        };
+        let conv = factory.CreateFormatConverter()?;
+        conv.Initialize(&source, &GUID_WICPixelFormat32bppPRGBA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        conv.CopyPixels(std::ptr::null(), tw * 4, &mut rgba).context("Pixel kopieren")?;
+        Ok((tw, th, rgba))
+    }
+}
+
 // ───────────────────────────── HTTPS ─────────────────────────────
 
 /// Einfacher HTTPS-GET über WinHTTP (in Windows enthalten: Proxy-Einstellungen und Zertifikatsprüfung

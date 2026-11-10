@@ -3,7 +3,7 @@
 
 use crate::audio::{AudioCapture, Levels, SharedLevels};
 use crate::config::{self, Config, Effect, Position, Wallpaper};
-use crate::overlay::{self, text::Line};
+use crate::overlay::{self, flight::Fx, Widget};
 use crate::platform::sys::{self, DesktopHost, Event, HostState, MenuItem, Monitor, Tray, WallpaperWindow};
 use crate::render::{DrawParams, Gpu, Overlay, Target, VideoTex};
 use crate::video::{DecodeOptions, Player};
@@ -43,8 +43,10 @@ struct Slot {
 struct Panel {
     pos: Position,
     /// Inhalt, aus dem das Bild gerastert wurde – unverändert → nichts zu tun.
-    lines: Vec<Line>,
+    content: Vec<Widget>,
     overlay: Overlay,
+    /// Laufender Countdown-Effekt (dann wird jedes Bild gezeichnet).
+    fx: Fx,
 }
 
 struct PlayerEntry {
@@ -473,7 +475,8 @@ impl App {
             slot.dirty |= entry.fresh;
             // Bei Stille nicht neu zeichnen – sonst liefe die GPU umsonst mit max_fps.
             let audible = levels.bass + levels.mid + levels.high + levels.level > 0.004;
-            let animated = audio_on && audible && slot.wallpaper.effect != Effect::None;
+            let effects = slot.panels.iter().any(|p| p.fx != Fx::None);
+            let animated = (audio_on && audible && slot.wallpaper.effect != Effect::None) || effects;
             // Großzügige Toleranz: Bilder kommen nie exakt im Takt. Mit 0,9 fiel bei 60-fps-Videos und
             // max_fps = 60 jedes leicht verfrühte Bild weg; mit 0,75 wird max_fps trotzdem eingehalten.
             if (slot.dirty || animated) && now - slot.last_render >= interval.mul_f32(0.75) {
@@ -484,6 +487,12 @@ impl App {
                     levels,
                     time,
                 };
+                if effects {
+                    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                    for p in &slot.panels {
+                        self.gpu.set_flash(&p.overlay, overlay::flash(p.fx, t));
+                    }
+                }
                 self.gpu.render(&mut slot.target, tex, &params, slot.panels.iter().map(|p| &p.overlay));
                 slot.last_render = now;
                 slot.dirty = false;
@@ -540,16 +549,17 @@ impl App {
                 continue;
             }
             let scale = overlay::scale_for(slot.window.height, cfg);
-            for (pos, lines) in &content {
+            for (pos, widgets) in &content {
                 let existing = slot.panels.iter().position(|p| p.pos == *pos);
-                if existing.is_some_and(|i| slot.panels[i].lines == *lines) {
+                if existing.is_some_and(|i| slot.panels[i].content == *widgets) {
                     continue;
                 }
-                let img = self.widgets.rasterize(lines, *pos, scale);
+                let img = self.widgets.rasterize(widgets, *pos, scale);
                 let (x, y) = overlay::place(*pos, &img, (slot.window.width, slot.window.height), monitor.work_insets, scale);
                 let old = existing.map(|i| slot.panels.remove(i).overlay);
-                let overlay = self.gpu.overlay(old, &slot.target, (img.width, img.height), &img.rgba, (x, y));
-                slot.panels.push(Panel { pos: *pos, lines: lines.clone(), overlay });
+                let overlay = self.gpu.overlay(old, &slot.target, (img.width, img.height), &img.rgba, &img.glow, (x, y));
+                let fx = widgets.iter().map(Widget::fx).find(|f| *f != Fx::None).unwrap_or(Fx::None);
+                slot.panels.push(Panel { pos: *pos, content: widgets.clone(), overlay, fx });
                 slot.dirty = true;
             }
         }

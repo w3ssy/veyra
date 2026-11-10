@@ -28,6 +28,7 @@ features = [
     "Win32_Security",
     "Win32_Storage_EnhancedStorage",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

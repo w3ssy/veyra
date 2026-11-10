@@ -92,12 +92,16 @@ pub struct Target {
     binds: Vec<(u64, wgpu::BindGroup)>,
 }
 
-/// Ein Widget-Bild auf einer Oberfläche (Textur mit vormultipliziertem Alpha plus Position).
+/// Ein Widget-Bild auf einer Oberfläche (Textur mit vormultipliziertem Alpha plus Position) und
+/// eine gleich große Leucht-Ebene, die der Shader mit `flash` dazumischt (Countdown-Effekt).
 pub struct Overlay {
     texture: wgpu::Texture,
+    glow: wgpu::Texture,
+    has_glow: bool,
     uniforms: wgpu::Buffer,
     bind: wgpu::BindGroup,
     size: (u32, u32),
+    flash: Cell<f32>,
 }
 
 pub struct DrawParams {
@@ -241,6 +245,16 @@ impl Dev {
             label: Some("veyra-overlay"),
             source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
         });
+        let overlay_tex = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -254,16 +268,8 @@ impl Dev {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                overlay_tex(1),
+                overlay_tex(2),
             ],
         });
         let overlay_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -521,24 +527,28 @@ impl Dev {
 }
 
 impl Gpu {
-    /// Widget-Bild (RGBA, vormultipliziert) für `target` hochladen; die Textur wird wiederverwendet,
-    /// solange die Größe gleich bleibt.
-    pub fn overlay(&self, current: Option<Overlay>, target: &Target, size: (u32, u32), rgba: &[u8], at: (i32, i32)) -> Overlay {
+    /// Widget-Bild (RGBA, vormultipliziert) für `target` hochladen; die Texturen werden wiederverwendet,
+    /// solange die Größe gleich bleibt. `glow` ist leer oder gleich groß wie `rgba`.
+    pub fn overlay(&self, current: Option<Overlay>, target: &Target, size: (u32, u32), rgba: &[u8], glow: &[u8], at: (i32, i32)) -> Overlay {
         let d = self.dev();
         let ((width, height), (x, y)) = (size, at);
-        let ov = match current {
+        let mut ov = match current {
             Some(o) if o.size == (width, height) => o,
             _ => {
-                let texture = d.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("veyra-widget"),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
+                let tex = |label| {
+                    d.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    })
+                };
+                let texture = tex("veyra-widget");
+                let glow_tex = tex("veyra-widget-glow");
                 let uniforms = d.device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: 32,
@@ -546,27 +556,48 @@ impl Gpu {
                     mapped_at_creation: false,
                 });
                 let view = texture.create_view(&Default::default());
+                let glow_view = glow_tex.create_view(&Default::default());
                 let bind = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &d.overlay_layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&glow_view) },
                     ],
                 });
-                Overlay { texture, uniforms, bind, size: (width, height) }
+                // Neue Texturen sind leer (wgpu initialisiert sie mit 0) – also auch kein Leuchten.
+                Overlay { texture, glow: glow_tex, has_glow: false, uniforms, bind, size: (width, height), flash: Cell::new(0.0) }
             }
         };
-        d.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &ov.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            rgba,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        let u: [f32; 8] = [x as f32, y as f32, width as f32, height as f32, target.config.width as f32, target.config.height as f32, 0.0, 0.0];
+        let upload = |texture: &wgpu::Texture, data: &[u8]| {
+            d.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        };
+        upload(&ov.texture, rgba);
+        if !glow.is_empty() {
+            upload(&ov.glow, glow);
+            ov.has_glow = true;
+        } else if ov.has_glow {
+            upload(&ov.glow, &vec![0u8; rgba.len()]);
+            ov.has_glow = false;
+        }
+        let u: [f32; 8] = [x as f32, y as f32, width as f32, height as f32, target.config.width as f32, target.config.height as f32, ov.flash.get(), 0.0];
         let bytes: Vec<u8> = u.iter().flat_map(|v| v.to_le_bytes()).collect();
         d.queue.write_buffer(&ov.uniforms, 0, &bytes);
         ov
+    }
+
+    /// Stärke des Leuchtens setzen (pro Bild, für den Countdown-Effekt). Schreibt nur bei Änderung.
+    pub fn set_flash(&self, ov: &Overlay, flash: f32) {
+        if (ov.flash.get() - flash).abs() > 1e-3 {
+            ov.flash.set(flash);
+            self.dev().queue.write_buffer(&ov.uniforms, 24, &flash.to_le_bytes());
+        }
     }
 
     pub fn render<'a>(&self, target: &mut Target, tex: &VideoTex, p: &DrawParams, overlays: impl IntoIterator<Item = &'a Overlay>) {

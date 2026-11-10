@@ -797,15 +797,18 @@ impl Settings {
         ui.add_space(12.0);
         widget_card(ui, "flight", &mut wd.flight_control.enabled, &mut wd.flight_control.position, clock_on.then_some(clock_pos), |ui, enabled| {
             ui.label(RichText::new("Flight Control").size(17.0).strong().color(Color32::WHITE));
-            ui.label(RichText::new("Der nächste Raketenstart weltweit: Countdown, Status, Rakete, Mission und Startplatz.").color(Color32::GRAY));
+            ui.label(
+                RichText::new("Der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit Terminal Count und Liftoff, Raketen-Scan, Mission-Patch, Startplatz.")
+                    .color(Color32::GRAY),
+            );
             ui.add_space(4.0);
             ui.checkbox(enabled, "Aktiv");
         }, |ui| {
             ui.label(
                 RichText::new(
                     "Einzige Funktion mit Internetzugriff: lädt alle 15 Minuten öffentliche Startdaten von ll.thespacedevs.com \
-                     (Launch Library 2 von The Space Devs). Gesendet wird nur die Anfrage selbst; ist das Widget aus, \
-                     gibt es keinen Netzwerkzugriff.",
+                     (Launch Library 2 von The Space Devs), dazu Raketenfoto und Mission-Patch der nächsten Starts. \
+                     Gesendet wird nur die Anfrage selbst; ist das Widget aus, gibt es keinen Netzwerkzugriff.",
                 )
                 .small()
                 .color(Color32::GRAY),

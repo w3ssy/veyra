@@ -29,16 +29,19 @@ Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschle
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
-- 🕐 **Widgets** – Uhr und **Flight Control** (Countdown zum nächsten Raketenstart weltweit) über dem Video,
-  in der Raumfahrt-Schrift Orbitron, jedes Widget an einer von 9 Positionen
+- 🕐 **Widgets** – Uhr und **Flight Control** über dem Video, in der Raumfahrt-Schrift Orbitron, jedes Widget
+  an einer von 9 Positionen
+- 🚀 **Flight Control** – der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit
+  *Terminal Count* und *Liftoff*-Effekt, die Rakete als Sensor-Scan, Mission-Patch im Instrumenten-Ring
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk¹, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
 Linux ist architektonisch vorbereitet (siehe [docs/ARCHITEKTUR.md](docs/ARCHITEKTUR.md)).
 
 ¹ Einzige Ausnahme: das Widget *Flight Control* – standardmäßig aus. Ist es aktiv, fragt Veyra alle 15 Minuten
-die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi) ab (eine fest eingebaute
-HTTPS-Adresse, nur lesend). Ohne Flight Control gibt es keinen einzigen Netzwerkaufruf.
+die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi) ab und lädt Raketenfoto und
+Mission-Patch der nächsten Starts aus deren Bildablage (zwei fest eingebaute HTTPS-Adressen, nur lesend).
+Ohne Flight Control gibt es keinen einzigen Netzwerkaufruf.
 
 ## Warum Veyra?
 
@@ -50,8 +53,8 @@ Videos effizient als Hintergrund abspielen.
 |---|---|
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
-| Netzwerk | Keiner – außer du schaltest Flight Control ein (dann eine einzige, fest eingebaute Adresse) |
-| Codebasis | ~6.000 Zeilen Rust, 11 direkte Abhängigkeiten |
+| Netzwerk | Keiner – außer du schaltest Flight Control ein (dann nur zwei fest eingebaute Adressen) |
+| Codebasis | ~7.000 Zeilen Rust, 11 direkte Abhängigkeiten |
 | Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist, Bilder verlassen nie den Grafikspeicher – und pausiert, wenn niemand hinsieht |
 
 ## Download
@@ -172,4 +175,5 @@ und `cargo test` ausführen (so prüft auch die CI).
 
 Eingebettete Schrift: [Orbitron](https://github.com/theleagueof/orbitron) © The Orbitron Project Authors,
 [SIL Open Font License 1.1](assets/Orbitron-OFL.txt).
-Startdaten: [Launch Library 2](https://thespacedevs.com/llapi) von The Space Devs.
+Startdaten, Fotos und Mission-Patches: [Launch Library 2](https://thespacedevs.com/llapi) von The Space Devs;
+die Rechte an Fotos und Patches liegen bei den jeweiligen Urhebern.
