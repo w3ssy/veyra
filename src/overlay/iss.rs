@@ -131,7 +131,7 @@ fn fetch() -> anyhow::Result<(String, Tle)> {
 // ── Inhalt ───────────────────────────────────────────────────────────────────
 
 /// Sichtbarer Kartenausschnitt: so viele Längengrade über die volle Breite.
-const SPAN_LON: f64 = 160.0;
+const SPAN_LON: f64 = 240.0;
 /// Bodenspur: so weit zurück und voraus (Sekunden) und in diesem Abstand.
 const TRACK_BACK: i64 = 45 * 60;
 const TRACK_AHEAD: i64 = 95 * 60;
@@ -218,10 +218,10 @@ const MAP_H: f32 = 196.0;
 /// Innenhöhe: Kopf, Karte, Datenzeile.
 const H: f32 = MAP_Y + MAP_H + 36.0;
 /// Abstand der Kartenpunkte in Grad – fest an der Erde, damit sie beim Scrollen mitwandern.
-const DOT: f64 = 1.5;
+const DOT: f64 = 2.0;
 
 /// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
-pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> Image {
+pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> (Image, Option<RadarSpot>) {
     let iw = hud::inner(w);
     let mut c = hud::panel(w, H + 2.0 * hud::PAD, s);
     let mut pills: Vec<(&str, Color)> = vec![d.status];
@@ -268,6 +268,8 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> Image {
         let cz = la.sin() * sdec.sin() + la.cos() * sdec.cos() * (lon - slon).to_radians().cos();
         ((cz + 0.08) / 0.16).clamp(0.0, 1.0) as f32
     };
+    // Land: zarte Fläche je Zelle (zeigt die Umrisse) plus kräftiger Punkt; Meer nur als feines Raster.
+    let cell = (DOT / k) as f32 / 2.0;
     let mut lat = ((clat - half_h) / DOT).floor() * DOT;
     while lat <= clat + half_h + DOT {
         let mut lon = ((clon - half_w) / DOT).floor() * DOT;
@@ -275,9 +277,10 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> Image {
             let p = proj(lat, lon);
             let day = daylight(lat, lon);
             if is_land(lat, lon) {
-                c.disc(Layer::Back, p, 1.3 * s, cyan((55.0 + 150.0 * day) as u8));
+                c.rect(Layer::Back, (p.0 - cell, p.1 - cell, p.0 + cell, p.1 + cell), cyan((16.0 + 26.0 * day) as u8));
+                c.disc(Layer::Back, p, 1.35 * s, cyan((115.0 + 140.0 * day) as u8));
             } else {
-                c.disc(Layer::Back, p, 0.75 * s, cyan((10.0 + 16.0 * day) as u8));
+                c.disc(Layer::Back, p, 0.7 * s, cyan((8.0 + 10.0 * day) as u8));
             }
             lon += DOT;
         }
@@ -299,8 +302,23 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> Image {
         }
     }
 
+    let mut spot = None;
     match &d.pos {
-        Some(p) => draw_iss(&mut c, fonts, s, p, &proj, (mw, mh)),
+        Some(p) => {
+            draw_iss(&mut c, fonts, s, p, &proj, (mw, mh));
+            // Bereich für den Radar-Puls: Quadrat um die ISS, auf die Karte beschnitten.
+            let (cx, cy) = proj(p.lat as f64, p.lon as f64);
+            let r = RADAR_R * s + 3.0;
+            let (x0, y0) = ((cx - r).max(mx0).floor(), (cy - r).max(my0).floor());
+            let (x1, y1) = ((cx + r).min(mx1).ceil(), (cy + r).min(my1).ceil());
+            if x1 > x0 && y1 > y0 {
+                let (ox, oy) = c.origin();
+                spot = Some(RadarSpot {
+                    rect: (ox + x0 as u32, oy + y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
+                    center: (cx - x0, cy - y0),
+                });
+            }
+        }
         None => {
             let l = Line::new(11.0, Weight::Bold).tracking(0.2).span("AWAITING TELEMETRY", cyan(210));
             let lw = text::width(fonts, &l, s);
@@ -343,7 +361,103 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> Image {
         c.text(Layer::Fore, fonts, &hud::tiny(label, DIM), s, x, y);
         c.text(Layer::Fore, fonts, &value.clone().span(v.as_str(), SOFT), s, x, y + 12.0 * s);
     }
-    c.finish(s)
+    (c.finish(s), spot)
+}
+
+// ── Radar-Puls ───────────────────────────────────────────────────────────────
+
+/// Größter Radius des Pulses (bei Skalierung 1).
+const RADAR_R: f32 = 44.0;
+/// Alle so viele Sekunden ein Puls, der so lange nach außen läuft.
+const RADAR_PERIOD: f64 = 3.0;
+const RADAR_RUN: f64 = 1.6;
+
+/// Wo der Puls im fertigen Bild gezeichnet wird: Rechteck (x, y, Breite, Höhe) und ISS-Mitte darin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadarSpot {
+    pub rect: super::analyzer::Screen,
+    pub center: (f32, f32),
+}
+
+/// Sonar-Ring um die ISS: läuft alle 3 s nach außen und verblasst – reines Licht in der Leucht-Ebene.
+/// Gezeichnet wird nur, solange ein Puls läuft; dazwischen ruht das Widget.
+pub struct Radar {
+    pub spot: RadarSpot,
+    scale: f32,
+    out: Vec<u8>,
+    lit: bool,
+}
+
+impl Radar {
+    pub fn new(spot: RadarSpot, scale: f32) -> Self {
+        let n = (spot.rect.2 * spot.rect.3 * 4) as usize;
+        Self { spot, scale, out: vec![0; n], lit: false }
+    }
+
+    /// Fortschritt des laufenden Pulses (0 … 1) oder `None` dazwischen. Takt nach der Uhrzeit,
+    /// damit er auf allen Monitoren gleich läuft und beim Neuzeichnen nicht neu beginnt.
+    fn phase(t: f64) -> Option<f32> {
+        let p = t.rem_euclid(RADAR_PERIOD) / RADAR_RUN;
+        (p < 1.0).then_some(p as f32)
+    }
+
+    fn wall() -> f64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    }
+
+    /// Braucht es ein neues Bild? (Puls läuft, oder der letzte muss noch gelöscht werden.)
+    pub fn busy(&self) -> bool {
+        Self::phase(Self::wall()).is_some() || self.lit
+    }
+
+    pub fn current(&self) -> &[u8] {
+        &self.out
+    }
+
+    pub fn step(&mut self) -> &[u8] {
+        self.draw(Self::phase(Self::wall()));
+        &self.out
+    }
+
+    pub(super) fn draw(&mut self, phase: Option<f32>) {
+        self.out.fill(0);
+        self.lit = false;
+        let Some(p) = phase else { return };
+        let (w, h) = (self.spot.rect.2 as usize, self.spot.rect.3 as usize);
+        let (cx, cy) = self.spot.center;
+        let s = self.scale;
+        // Zwei Ringe kurz hintereinander, außen schnell, dann langsamer (ease-out), dabei verblassend.
+        let rings: Vec<(f32, f32)> = [p, p - 0.22]
+            .into_iter()
+            .filter(|q| *q > 0.0)
+            .map(|q| {
+                let e = 1.0 - (1.0 - q).powi(3);
+                (9.0 * s + (RADAR_R - 9.0) * s * e, 0.75 * (1.0 - q).powf(1.6))
+            })
+            .collect();
+        let width = 1.1 * s;
+        for y in 0..h {
+            for x in 0..w {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let mut v = 0.0f32;
+                for &(r, a) in &rings {
+                    let edge = (d - r) / width;
+                    v += a * (-edge * edge).exp();
+                    // Schwacher Schleier innerhalb des Rings
+                    if d < r {
+                        v += a * 0.05 * (d / r);
+                    }
+                }
+                if v > 0.004 {
+                    let i = (y * w + x) * 4;
+                    let px = [CYAN[0] as f32, CYAN[1] as f32, CYAN[2] as f32].map(|c| (c * v.min(1.0)) as u8);
+                    self.out[i..i + 3].copy_from_slice(&px);
+                    self.out[i + 3] = px[0].max(px[1]).max(px[2]);
+                    self.lit = true;
+                }
+            }
+        }
+    }
 }
 
 /// Bodenspur, Sichtbarkeitsradius und das ISS-Symbol.
@@ -430,13 +544,35 @@ mod tests {
         assert_eq!(thousands(27_580), "27.580");
         assert_eq!(thousands(580), "580");
         let fonts = Fonts::new();
-        let img = render(&d, &fonts, 1.0, WIDTH);
+        let (img, spot) = render(&d, &fonts, 1.0, WIDTH);
         assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
+        let spot = spot.expect("Radar-Bereich um die ISS");
+        assert!(spot.rect.0 + spot.rect.2 <= img.width && spot.rect.1 + spot.rect.3 <= img.height);
         let waiting = content(View::Waiting, now);
         assert!(waiting.pos.is_none());
-        render(&waiting, &fonts, 1.25, WIDTH);
+        assert!(render(&waiting, &fonts, 1.25, WIDTH).1.is_none(), "ohne Position kein Puls");
         // Alte Bahndaten werden markiert.
         let old = content(View::Live(super::orbit::tests::iss()), now + 5 * 86_400);
         assert_eq!(old.status.0, "OLD TLE");
+    }
+
+    #[test]
+    fn radar_pulses_and_rests() {
+        // Takt: 1,6 s Puls, dann Ruhe bis zum nächsten nach 3 s.
+        assert_eq!(Radar::phase(30.0), Some(0.0));
+        assert!(Radar::phase(30.8).is_some_and(|p| (p - 0.5).abs() < 1e-3));
+        assert_eq!(Radar::phase(31.7), None);
+        assert_eq!(Radar::phase(32.9), None);
+        let spot = RadarSpot { rect: (0, 0, 96, 96), center: (48.0, 48.0) };
+        let mut r = Radar::new(spot, 1.0);
+        r.draw(Some(0.4));
+        assert!(r.lit);
+        // Mitte bleibt frei (dort sitzt das Symbol), auf dem Ring ist es hell.
+        let at = |r: &Radar, x: usize, y: usize| r.out[(y * 96 + x) * 4 + 1];
+        assert!(at(&r, 48, 48) < 30);
+        let ring = (9.0 + 35.0 * (1.0 - 0.6f32.powi(3))) as usize;
+        assert!(at(&r, 48 + ring, 48) > 40, "{}", at(&r, 48 + ring, 48));
+        r.draw(None);
+        assert!(!r.lit && r.out.iter().all(|&v| v == 0));
     }
 }

@@ -23,7 +23,7 @@ pub mod spaceclock;
 pub mod text;
 pub mod time;
 
-use crate::audio::SharedScope;
+use crate::audio::{Scope, SharedScope};
 use crate::config::{self, AnalyzerMode, Position};
 use crate::platform::sys;
 use canvas::Image;
@@ -68,11 +68,77 @@ impl Widget {
     }
 }
 
-/// Schirm des Signal Analyzers innerhalb eines gerasterten Panels.
+/// Bereich eines gerasterten Bildes, der pro Bild neu gezeichnet wird (Leucht-Ebene).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LiveScreen {
-    pub rect: analyzer::Screen,
-    pub mode: AnalyzerMode,
+pub enum LiveScreen {
+    /// Schirm des Signal Analyzers.
+    Analyzer { rect: analyzer::Screen, mode: AnalyzerMode },
+    /// Radar-Puls um die ISS.
+    Radar(iss::RadarSpot),
+}
+
+impl LiveScreen {
+    fn shift(&mut self, (dx, dy): (u32, u32)) {
+        let rect = match self {
+            LiveScreen::Analyzer { rect, .. } => rect,
+            LiveScreen::Radar(spot) => &mut spot.rect,
+        };
+        rect.0 += dx;
+        rect.1 += dy;
+    }
+}
+
+/// Was in einem solchen Bereich läuft: Phosphor-Spur oder Radar-Puls.
+pub enum Live {
+    Phosphor(analyzer::Phosphor),
+    Radar(iss::Radar),
+}
+
+impl Live {
+    /// Neu anlegen – oder den bisherigen behalten, wenn er noch passt (dann bleibt das Nachleuchten erhalten).
+    pub fn reuse(old: Option<Live>, screen: LiveScreen, scale: f32) -> Live {
+        match (old, screen) {
+            (Some(Live::Phosphor(ph)), LiveScreen::Analyzer { rect, mode }) if ph.fits(rect, mode) => Live::Phosphor(ph),
+            (_, LiveScreen::Analyzer { rect, mode }) => Live::Phosphor(analyzer::Phosphor::new(rect, mode, scale)),
+            (Some(Live::Radar(r)), LiveScreen::Radar(spot)) if r.spot == spot => Live::Radar(r),
+            (_, LiveScreen::Radar(spot)) => Live::Radar(iss::Radar::new(spot, scale)),
+        }
+    }
+
+    pub fn rect(&self) -> analyzer::Screen {
+        match self {
+            Live::Phosphor(ph) => ph.screen,
+            Live::Radar(r) => r.spot.rect,
+        }
+    }
+
+    /// Braucht es ein neues Bild?
+    pub fn busy(&self, scope: &Scope) -> bool {
+        match self {
+            Live::Phosphor(ph) => ph.busy(scope),
+            Live::Radar(r) => r.busy(),
+        }
+    }
+
+    /// Ein Bild weiter; liefert RGBA für die Leucht-Ebene.
+    pub fn step(&mut self, scope: &Scope, now: std::time::Instant) -> &[u8] {
+        match self {
+            Live::Phosphor(ph) => ph.step(scope, now),
+            Live::Radar(r) => r.step(),
+        }
+    }
+
+    pub fn current(&self) -> &[u8] {
+        match self {
+            Live::Phosphor(ph) => ph.current(),
+            Live::Radar(r) => r.current(),
+        }
+    }
+
+    /// Braucht dieser Bereich die Messdaten des Audio-Threads?
+    pub fn needs_scope(&self) -> bool {
+        matches!(self, Live::Phosphor(_))
+    }
 }
 
 /// Inhalt je Position (Reihenfolge stabil).
@@ -170,9 +236,9 @@ impl Widgets {
         out
     }
 
-    /// Alle Widgets einer Position rastern und untereinander stapeln. Liefert dazu, wo im Bild
-    /// der Schirm des Signal Analyzers liegt (falls er dabei ist).
-    pub fn rasterize(&mut self, widgets: &[Widget], pos: Position, scale: f32) -> (Image, Option<LiveScreen>) {
+    /// Alle Widgets einer Position rastern und untereinander stapeln. Liefert dazu die Bereiche,
+    /// die pro Bild neu gezeichnet werden (Schirm des Signal Analyzers, Radar-Puls der ISS).
+    pub fn rasterize(&mut self, widgets: &[Widget], pos: Position, scale: f32) -> (Image, Vec<LiveScreen>) {
         let align = match pos.grid().0 {
             0 => Align::Left,
             1 => Align::Center,
@@ -180,7 +246,7 @@ impl Widgets {
         };
         // Gestapelte Panels bekommen alle die Breite des breitesten – sie bilden eine bündige Spalte.
         let width = widgets.iter().filter_map(Widget::panel_width).fold(0.0, f32::max);
-        let mut live = None;
+        let mut live: Vec<(usize, LiveScreen)> = Vec::new();
         let images: Vec<Image> = widgets
             .iter()
             .enumerate()
@@ -189,20 +255,26 @@ impl Widgets {
                 Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache, width),
                 Widget::SpaceClock(c) => spaceclock::render(c, &self.fonts, scale, width),
                 Widget::Dsn(d) => dsnnow::render(d, &self.fonts, scale, width),
-                Widget::Iss(d) => iss::render(d, &self.fonts, scale, width),
+                Widget::Iss(d) => {
+                    let (img, spot) = iss::render(d, &self.fonts, scale, width);
+                    live.extend(spot.map(|s| (i, LiveScreen::Radar(s))));
+                    img
+                }
                 Widget::Analyzer(a) => {
                     let (img, rect) = analyzer::render(a, &self.fonts, scale, width);
-                    live = Some((i, LiveScreen { rect, mode: a.mode() }));
+                    live.push((i, LiveScreen::Analyzer { rect, mode: a.mode() }));
                     img
                 }
             })
             .collect();
         let (img, offsets) = stack(images, align, (STACK_GAP * scale).round() as u32);
-        let live = live.map(|(i, mut l)| {
-            l.rect.0 += offsets[i].0;
-            l.rect.1 += offsets[i].1;
-            l
-        });
+        let live = live
+            .into_iter()
+            .map(|(i, mut l)| {
+                l.shift(offsets[i]);
+                l
+            })
+            .collect();
         (img, live)
     }
 }
@@ -318,12 +390,37 @@ mod tests {
         assert_eq!(c.len(), 1);
         let (alone, screen_alone) = w.rasterize(&c[0].1[1..], Position::Right, 1.0);
         let (both, screen) = w.rasterize(&c[0].1, Position::Right, 1.0);
-        let (a, b) = (screen_alone.unwrap().rect, screen.unwrap().rect);
+        let rect = |l: &[LiveScreen]| match l {
+            [LiveScreen::Analyzer { rect, .. }] => *rect,
+            other => panic!("{other:?}"),
+        };
+        let (a, b) = (rect(&screen_alone), rect(&screen));
         assert_eq!((a.2, a.3), (b.2, b.3));
         // Rechtsbündig gestapelt: der Analyzer liegt unter der Uhr.
         assert_eq!(b.0, a.0 + (both.width - alone.width));
         assert!(b.1 > a.1 + 100);
         assert!(b.0 + b.2 <= both.width && b.1 + b.3 <= both.height);
+    }
+
+    #[test]
+    fn iss_and_analyzer_share_a_position() {
+        let mut w = Widgets::new();
+        // Mit Bahndaten hat die ISS eine Position und damit einen Puls: zwei Bereiche in einem Panel.
+        let tle = orbit::tests::iss();
+        let widgets = vec![
+            Widget::Iss(Box::new(iss::content(iss::View::Live(tle.clone()), tle.epoch as i64 + 600))),
+            Widget::Analyzer(analyzer::content(AnalyzerMode::Spectrum, &Default::default())),
+        ];
+        let (img, live) = w.rasterize(&widgets, Position::Left, 1.0);
+        assert_eq!(live.len(), 2);
+        assert!(matches!(live[0], LiveScreen::Radar(_)) && matches!(live[1], LiveScreen::Analyzer { .. }));
+        for l in &live {
+            let r = Live::reuse(None, *l, 1.0).rect();
+            assert!(r.0 + r.2 <= img.width && r.1 + r.3 <= img.height, "{r:?}");
+        }
+        // Radar und Analyzer überlappen nicht.
+        let (r, a) = (Live::reuse(None, live[0], 1.0).rect(), Live::reuse(None, live[1], 1.0).rect());
+        assert!(r.1 + r.3 <= a.1);
     }
 }
 

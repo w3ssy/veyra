@@ -3,7 +3,7 @@
 
 use crate::audio::{AudioCapture, Levels, Scope, SharedLevels};
 use crate::config::{self, Config, Effect, Position, Wallpaper};
-use crate::overlay::{self, analyzer::Phosphor, flight::Fx, Widget};
+use crate::overlay::{self, flight::Fx, Live, Widget};
 use crate::platform::sys::{self, DesktopHost, Event, HostState, MenuItem, Monitor, Tray, WallpaperWindow};
 use crate::render::{DrawParams, Gpu, Overlay, Target, VideoTex};
 use crate::video::{DecodeOptions, Player};
@@ -47,8 +47,8 @@ struct Panel {
     overlay: Overlay,
     /// Laufender Countdown-Effekt (dann wird jedes Bild gezeichnet).
     fx: Fx,
-    /// Leuchtspur des Signal Analyzers, falls er in diesem Panel steckt (wird pro Bild gezeichnet).
-    live: Option<Phosphor>,
+    /// Pro Bild gezeichnete Bereiche: Leuchtspur des Signal Analyzers, Radar-Puls der ISS.
+    live: Vec<Live>,
 }
 
 struct PlayerEntry {
@@ -469,7 +469,7 @@ impl App {
         // Läuft der Mitschnitt nur für den Signal Analyzer, bleiben die Video-Effekte aus.
         let audio_on = self.audio.is_some() && self.cfg.needs_audio();
         let levels = if audio_on { self.levels.lock().map(|l| *l).unwrap_or_default() } else { Levels::default() };
-        let scope: Option<Scope> = if self.audio.is_some() && self.slots.iter().any(|s| s.panels.iter().any(|p| p.live.is_some())) {
+        let scope: Option<Scope> = if self.audio.is_some() && self.slots.iter().any(|s| s.panels.iter().any(|p| p.live.iter().any(Live::needs_scope))) {
             self.scope_snapshot()
         } else {
             None
@@ -491,7 +491,7 @@ impl App {
             let audible = levels.bass + levels.mid + levels.high + levels.level > 0.004;
             let effects = slot.panels.iter().any(|p| p.fx != Fx::None);
             let sc = scope.as_ref().unwrap_or(&quiet);
-            let live = slot.panels.iter().any(|p| p.live.as_ref().is_some_and(|l| l.busy(sc)));
+            let live = slot.panels.iter().any(|p| p.live.iter().any(|l| l.busy(sc)));
             let animated = (audio_on && audible && slot.wallpaper.effect != Effect::None) || effects || live;
             // Großzügige Toleranz: Bilder kommen nie exakt im Takt. Mit 0,9 fiel bei 60-fps-Videos und
             // max_fps = 60 jedes leicht verfrühte Bild weg; mit 0,75 wird max_fps trotzdem eingehalten.
@@ -505,16 +505,18 @@ impl App {
                 };
                 if effects {
                     let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                    for p in slot.panels.iter().filter(|p| p.live.is_none()) {
+                    for p in slot.panels.iter().filter(|p| p.live.is_empty()) {
                         self.gpu.set_flash(&p.overlay, overlay::flash(p.fx, t));
                     }
                 }
                 if live {
                     for p in &mut slot.panels {
-                        if let Some(ph) = p.live.as_mut() {
-                            let screen = ph.screen;
-                            self.gpu.overlay_glow(&mut p.overlay, screen, ph.step(sc, now));
-                            // Die Leuchtspur ist reines Licht in voller Stärke.
+                        for l in &mut p.live {
+                            let rect = l.rect();
+                            self.gpu.overlay_glow(&mut p.overlay, rect, l.step(sc, now));
+                        }
+                        if !p.live.is_empty() {
+                            // Leuchtspur und Puls sind reines Licht in voller Stärke.
                             self.gpu.set_flash(&p.overlay, 1.0);
                         }
                     }
@@ -583,17 +585,17 @@ impl App {
                 let (img, screen) = self.widgets.rasterize(widgets, *pos, scale);
                 let (x, y) = overlay::place(*pos, &img, (slot.window.width, slot.window.height), monitor.work_insets, scale);
                 let old = existing.map(|i| slot.panels.remove(i));
-                let (old_overlay, old_live) = old.map_or((None, None), |p| (Some(p.overlay), p.live));
+                let (old_overlay, old_live) = old.map_or((None, Vec::new()), |p| (Some(p.overlay), p.live));
                 let mut overlay = self.gpu.overlay(old_overlay, &slot.target, (img.width, img.height), &img.rgba, &img.glow, (x, y));
                 let fx = widgets.iter().map(Widget::fx).find(|f| *f != Fx::None).unwrap_or(Fx::None);
-                // Nachleuchten behalten, wenn der Schirm gleich geblieben ist – sonst neu anfangen.
-                let live = screen.map(|sc| match old_live {
-                    Some(ph) if ph.fits(sc.rect, sc.mode) => ph,
-                    _ => Phosphor::new(sc.rect, sc.mode, scale),
-                });
-                if let Some(ph) = &live {
-                    // Das neue Bild hat die Leucht-Ebene geleert; die Spur sofort wieder einsetzen.
-                    self.gpu.overlay_glow(&mut overlay, ph.screen, ph.current());
+                // Nachleuchten behalten, wenn der Bereich gleich geblieben ist – sonst neu anfangen.
+                let mut old_live = old_live.into_iter();
+                let live: Vec<Live> = screen.into_iter().map(|sc| Live::reuse(old_live.next(), sc, scale)).collect();
+                for l in &live {
+                    // Das neue Bild hat die Leucht-Ebene geleert; den letzten Stand sofort wieder einsetzen.
+                    self.gpu.overlay_glow(&mut overlay, l.rect(), l.current());
+                }
+                if !live.is_empty() {
                     self.gpu.set_flash(&overlay, 1.0);
                 }
                 slot.panels.push(Panel { pos: *pos, content: widgets.clone(), overlay, fx, live });

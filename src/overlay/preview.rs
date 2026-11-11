@@ -167,11 +167,15 @@ fn preview() {
 
     let tle = super::orbit::tests::iss();
     let iss_now = super::iss::content(super::iss::View::Live(tle.clone()), tle.epoch as i64 + 2400);
-    let img = super::iss::render(&iss_now, &fonts, 1.0, super::iss::WIDTH);
-    write_png(&dir.join("iss_tracker.png"), img.width, img.height, &compose(&img, None));
-    let iss_night = super::iss::content(super::iss::View::Live(tle.clone()), tle.epoch as i64 + 4300);
-    let img = super::iss::render(&iss_night, &fonts, 1.0, super::iss::WIDTH);
-    write_png(&dir.join("iss_tracker_2.png"), img.width, img.height, &compose(&img, None));
+    // Mit Radar-Puls mitten im Lauf, wie er live aussieht.
+    for (name, at, phase) in [("iss_tracker.png", 2400, 0.35), ("iss_tracker_2.png", 4300, 0.6)] {
+        let d = super::iss::content(super::iss::View::Live(tle.clone()), tle.epoch as i64 + at);
+        let (img, spot) = super::iss::render(&d, &fonts, 1.0, super::iss::WIDTH);
+        let spot = spot.unwrap();
+        let mut radar = super::iss::Radar::new(spot, 1.0);
+        radar.draw(Some(phase));
+        write_png(&dir.join(name), img.width, img.height, &compose(&img, Some((&spot.rect, radar.current()))));
+    }
 
     let mut cache = flight::Cache::default();
     let fl = flight::content(rocket(now + 21_447), now);
@@ -216,15 +220,25 @@ fn preview() {
         for (pos, list) in layout {
             let (img, live) = widgets.rasterize(&list, pos, 1.0);
             let (px, py) = place(pos, &img, (sw, sh), [0, 0, 0, 48], 1.0);
-            let glow = live.map(|l| {
-                let mut ph = analyzer::Phosphor::new(l.rect, l.mode, 1.0);
-                let mut t = Instant::now();
-                for f in 0..14 {
-                    t += Duration::from_millis(16);
-                    ph.step(&music(f), t);
-                }
-                (l.rect, ph.current().to_vec())
-            });
+            let glows: Vec<(analyzer::Screen, Vec<u8>)> = live
+                .into_iter()
+                .map(|l| match l {
+                    super::LiveScreen::Analyzer { rect, mode } => {
+                        let mut ph = analyzer::Phosphor::new(rect, mode, 1.0);
+                        let mut t = Instant::now();
+                        for f in 0..14 {
+                            t += Duration::from_millis(16);
+                            ph.step(&music(f), t);
+                        }
+                        (rect, ph.current().to_vec())
+                    }
+                    super::LiveScreen::Radar(spot) => {
+                        let mut r = super::iss::Radar::new(spot, 1.0);
+                        r.draw(Some(0.35));
+                        (spot.rect, r.current().to_vec())
+                    }
+                })
+                .collect();
             for y in 0..img.height {
                 for x in 0..img.width {
                     let (ox, oy) = (px + x as i32, py + y as i32);
@@ -236,7 +250,7 @@ fn preview() {
                     let a = img.rgba[i + 3] as f32 / 255.0;
                     for k in 0..3 {
                         let mut g = if img.glow.is_empty() { 0.0 } else { img.glow[i + k] as f32 };
-                        if let Some(((gx, gy, gw, gh), data)) = &glow {
+                        for ((gx, gy, gw, gh), data) in &glows {
                             if x >= *gx && y >= *gy && x < gx + gw && y < gy + gh {
                                 g = data[(((y - gy) * gw + x - gx) * 4) as usize + k] as f32;
                             }
