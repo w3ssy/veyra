@@ -861,7 +861,7 @@ pub fn autostart_current() -> bool {
 
 // ───────────────────────────── Dateidialoge (Einstellungsfenster) ─────────────────────────────
 
-/// Windows-Dialog „Öffnen“ für Videos bzw. (bei `folder`) für einen Ordner. `None` = abgebrochen.
+/// Windows-Dialog „Öffnen“ für Videos und Bilder bzw. (bei `folder`) für einen Ordner. `None` = abgebrochen.
 pub fn pick_path(folder: bool, start: Option<&Path>) -> Option<std::path::PathBuf> {
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -870,18 +870,22 @@ pub fn pick_path(folder: bool, start: Option<&Path>) -> Option<std::path::PathBu
         let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         if folder {
             let _ = dlg.SetOptions(dlg.GetOptions().unwrap_or_default() | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-            let _ = dlg.SetTitle(w!("Ordner für die Video-Bibliothek wählen"));
+            let _ = dlg.SetTitle(w!("Ordner für die Bibliothek wählen"));
         } else {
-            let pattern = crate::config::VIDEO_EXTENSIONS.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";");
-            let (name, spec) = (HSTRING::from("Videos"), HSTRING::from(pattern));
-            let (all_name, all_spec) = (HSTRING::from("Alle Dateien"), HSTRING::from("*.*"));
-            let filters = [
-                COMDLG_FILTERSPEC { pszName: PCWSTR(name.as_ptr()), pszSpec: PCWSTR(spec.as_ptr()) },
-                COMDLG_FILTERSPEC { pszName: PCWSTR(all_name.as_ptr()), pszSpec: PCWSTR(all_spec.as_ptr()) },
+            use crate::config::{IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
+            let pattern = |list: &[&str]| HSTRING::from(list.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";"));
+            // Die HSTRINGs müssen leben, solange der Dialog die Zeiger hält.
+            let specs = [
+                (HSTRING::from("Videos und Bilder"), pattern(&[VIDEO_EXTENSIONS, IMAGE_EXTENSIONS].concat())),
+                (HSTRING::from("Videos"), pattern(VIDEO_EXTENSIONS)),
+                (HSTRING::from("Bilder"), pattern(IMAGE_EXTENSIONS)),
+                (HSTRING::from("Alle Dateien"), HSTRING::from("*.*")),
             ];
+            let filters: Vec<COMDLG_FILTERSPEC> =
+                specs.iter().map(|(n, s)| COMDLG_FILTERSPEC { pszName: PCWSTR(n.as_ptr()), pszSpec: PCWSTR(s.as_ptr()) }).collect();
             let _ = dlg.SetFileTypes(&filters);
             let _ = dlg.SetOptions(dlg.GetOptions().unwrap_or_default() | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
-            let _ = dlg.SetTitle(w!("Video wählen"));
+            let _ = dlg.SetTitle(w!("Video oder Bild wählen"));
         }
         if let Some(dir) = start.filter(|d| d.is_dir()) {
             if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
@@ -978,8 +982,6 @@ pub fn local_time(unix: i64) -> crate::overlay::time::DateTime {
 /// Liefert Breite, Höhe und RGBA mit vormultipliziertem Alpha, verkleinert auf höchstens `max_side`.
 pub fn decode_image(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
     use windows::Win32::Graphics::Imaging::*;
-    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
-
     let container = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         GUID_ContainerFormatJpeg
     } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -987,6 +989,44 @@ pub fn decode_image(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>)> 
     } else {
         bail!("weder JPEG noch PNG");
     };
+    decode_with(bytes, container, |w, h| {
+        let k = (max_side as f32 / w.max(h) as f32).min(1.0);
+        (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1))
+    })
+}
+
+/// Größte Bilddatei, die als Wallpaper gelesen wird.
+const MAX_IMAGE_FILE: u64 = 256 * 1024 * 1024;
+
+/// Bilddatei als Wallpaper lesen: JPEG, PNG, BMP, GIF (erstes Bild) oder TIFF – erkannt an der Signatur,
+/// nicht an der Endung, und nur mit den eingebauten Decodern von Windows. `size(w, h)` bestimmt die Zielgröße
+/// (Verkleinern übernimmt WIC beim Dekodieren). Liefert RGBA mit vormultipliziertem Alpha.
+pub fn decode_image_file(path: &Path, size: impl FnOnce(u32, u32) -> (u32, u32)) -> Result<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Imaging::*;
+    let len = std::fs::metadata(path).context("Bild öffnen")?.len();
+    if len > MAX_IMAGE_FILE {
+        bail!("Bilddatei zu groß ({} MB)", len / (1024 * 1024));
+    }
+    let bytes = std::fs::read(path).context("Bild lesen")?;
+    let container = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        GUID_ContainerFormatJpeg
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        GUID_ContainerFormatPng
+    } else if bytes.starts_with(b"BM") {
+        GUID_ContainerFormatBmp
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        GUID_ContainerFormatGif
+    } else if bytes.starts_with(&[b'I', b'I', b'*', 0]) || bytes.starts_with(&[b'M', b'M', 0, b'*']) {
+        GUID_ContainerFormatTiff
+    } else {
+        bail!("kein unterstütztes Bildformat (JPEG, PNG, BMP, GIF, TIFF)");
+    };
+    decode_with(&bytes, container, size)
+}
+
+fn decode_with(bytes: &[u8], container: windows::core::GUID, size: impl FnOnce(u32, u32) -> (u32, u32)) -> Result<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
     // SAFETY: COM-Aufrufe mit gültigen Zeigern; `bytes` lebt länger als der Stream.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1001,8 +1041,8 @@ pub fn decode_image(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>)> 
         if w == 0 || h == 0 || w > 16_384 || h > 16_384 {
             bail!("unplausible Bildgröße {w}x{h}");
         }
-        let k = (max_side as f32 / w.max(h) as f32).min(1.0);
-        let (tw, th) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+        let (tw, th) = size(w, h);
+        let (tw, th) = (tw.clamp(1, w), th.clamp(1, h));
         let source: IWICBitmapSource = if (tw, th) != (w, h) {
             let scaler = factory.CreateBitmapScaler()?;
             scaler.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant)?;

@@ -232,7 +232,7 @@ impl Settings {
         self.same_for_all = self.per.windows(2).all(|p| same(&p[0], &p[1]));
         self.all = Wallpaper { monitor: MonitorSel::All, ..self.per.first().cloned().unwrap_or_default() };
         self.cfg = cfg;
-        self.library = self.cfg.library.videos();
+        self.library = self.cfg.library.media();
         self.baseline = self.compose();
     }
 
@@ -512,7 +512,7 @@ impl eframe::App for Settings {
             let screen = ctx.content_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
             painter.rect_filled(screen, 0.0, Color32::from_black_alpha(170));
-            painter.text(screen.center(), Align2::CENTER_CENTER, "Video auf einen Monitor ziehen und loslassen", FontId::proportional(22.0), Color32::WHITE);
+            painter.text(screen.center(), Align2::CENTER_CENTER, "Video oder Bild auf einen Monitor ziehen und loslassen", FontId::proportional(22.0), Color32::WHITE);
         }
     }
 }
@@ -520,11 +520,12 @@ impl eframe::App for Settings {
 impl Settings {
     fn handle_drop(&mut self, ctx: &egui::Context) {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.hover_pos()));
-        let Some(video) = files.into_iter().map(|f| f.path().to_path_buf()).find(|p| config::is_video(p)) else { return };
+        let Some(video) = files.into_iter().map(|f| f.path().to_path_buf()).find(|p| config::is_media(p)) else { return };
         // Über welchem Monitor in der Übersicht wurde losgelassen?
         let target = pos.and_then(|p| self.monitor_rects.iter().position(|r| r.contains(p)));
+        let kind = if config::is_image(&video) { "Bild" } else { "Video" };
         self.assign(target, video);
-        self.set_status("Video zugewiesen – speichern nicht vergessen.".into(), false);
+        self.set_status(format!("{kind} zugewiesen – speichern nicht vergessen."), false);
     }
 
     fn section(ui: &mut egui::Ui, title: &str) {
@@ -543,7 +544,7 @@ impl Settings {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let before = self.same_for_all;
-            ui.checkbox(&mut self.same_for_all, "Ein Video für alle Monitore");
+            ui.checkbox(&mut self.same_for_all, "Ein Wallpaper für alle Monitore");
             if before && !self.same_for_all {
                 // Aufteilen: jeder Monitor startet mit dem bisher gemeinsamen Video.
                 for (i, w) in self.per.iter_mut().enumerate() {
@@ -553,7 +554,7 @@ impl Settings {
                 let i = self.selected.min(self.per.len().saturating_sub(1));
                 self.all = Wallpaper { monitor: MonitorSel::All, ..self.per.get(i).cloned().unwrap_or_default() };
             }
-            ui.label(RichText::new("· Monitor anklicken zum Auswählen, Videos auch per Drag & Drop").color(Color32::GRAY));
+            ui.label(RichText::new("· Monitor anklicken zum Auswählen, Videos und Bilder auch per Drag & Drop").color(Color32::GRAY));
         });
 
         let title = if self.same_for_all {
@@ -566,9 +567,9 @@ impl Settings {
         let library_dir = self.cfg.library.effective_folder();
         let w = self.current();
         egui::Grid::new("wp").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label("Video");
+            ui.label("Wallpaper");
             ui.horizontal(|ui| {
-                let name = if w.video.as_os_str().is_empty() { "– kein Video (Windows-Hintergrund) –".to_string() } else { file_name(&w.video) };
+                let name = if w.video.as_os_str().is_empty() { "– keins (Windows-Hintergrund) –".to_string() } else { file_name(&w.video) };
                 ui.label(RichText::new(name).strong()).on_hover_text(w.video.to_string_lossy());
                 if ui.button("Durchsuchen…").clicked() {
                     let start = w.video.parent().map(Path::to_path_buf).unwrap_or(library_dir.clone());
@@ -680,11 +681,11 @@ impl Settings {
             if ui.button("Ordner wählen…").clicked() {
                 if let Some(p) = sys::pick_path(true, Some(&folder)) {
                     self.cfg.library.folder = p;
-                    self.library = self.cfg.library.videos();
+                    self.library = self.cfg.library.media();
                 }
             }
             if ui.button("Aktualisieren").clicked() {
-                self.library = self.cfg.library.videos();
+                self.library = self.cfg.library.media();
             }
             if ui.button("Im Explorer öffnen").clicked() {
                 sys::open_path(&folder);
@@ -692,7 +693,7 @@ impl Settings {
         });
         ui.add_space(6.0);
         if self.library.is_empty() {
-            ui.label(RichText::new("Keine Videos in diesem Ordner. Lege Videos hinein oder wähle einen anderen Ordner.").color(Color32::GRAY));
+            ui.label(RichText::new("Keine Videos oder Bilder in diesem Ordner. Lege welche hinein oder wähle einen anderen Ordner.").color(Color32::GRAY));
             return;
         }
 
@@ -725,6 +726,12 @@ impl Settings {
                     Stroke::new(1.0, Color32::from_gray(60))
                 };
                 painter.rect_stroke(img, CornerRadius::same(6), stroke, StrokeKind::Inside);
+                if config::is_image(v) {
+                    // Kleine Marke oben links: Standbild statt Video.
+                    let tag = Rect::from_min_size(img.min + Vec2::new(6.0, 6.0), Vec2::new(36.0, 16.0));
+                    painter.rect_filled(tag, CornerRadius::same(3), Color32::from_black_alpha(170));
+                    painter.text(tag.center(), Align2::CENTER_CENTER, "BILD", FontId::proportional(10.5), Color32::from_gray(220));
+                }
                 let mut name = file_name(v);
                 if name.chars().count() > 28 {
                     name = name.chars().take(26).collect::<String>() + "…";
@@ -775,7 +782,7 @@ impl Settings {
         if wd.any_enabled() && !shows_video {
             ui.add_space(6.0);
             ui.label(
-                RichText::new("Auf diesem Monitor läuft kein Video – Widgets erscheinen nur über einem Video-Wallpaper.")
+                RichText::new("Auf diesem Monitor läuft kein Wallpaper – Widgets erscheinen nur über einem Video- oder Bild-Wallpaper.")
                     .color(Color32::from_rgb(0xF5, 0x9E, 0x0B)),
             );
         }

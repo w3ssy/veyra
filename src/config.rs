@@ -303,8 +303,24 @@ impl Widgets {
 /// Dateiendungen, die als Video gelten (Bibliothek, Drag & Drop).
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv"];
 
+/// Dateiendungen, die als Standbild gelten – Formate mit eingebautem Windows-Decoder (WIC).
+pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff"];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| list.iter().any(|v| v.eq_ignore_ascii_case(e)))
+}
+
 pub fn is_video(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTENSIONS.iter().any(|v| v.eq_ignore_ascii_case(e)))
+    has_extension(path, VIDEO_EXTENSIONS)
+}
+
+pub fn is_image(path: &Path) -> bool {
+    has_extension(path, IMAGE_EXTENSIONS)
+}
+
+/// Video oder Bild – alles, was als Wallpaper taugt.
+pub fn is_media(path: &Path) -> bool {
+    is_video(path) || is_image(path)
 }
 
 impl Library {
@@ -316,10 +332,10 @@ impl Library {
         home.join("Videos")
     }
 
-    /// Videos im Bibliotheksordner (nicht rekursiv), alphabetisch.
-    pub fn videos(&self) -> Vec<PathBuf> {
+    /// Videos und Bilder im Bibliotheksordner (nicht rekursiv), alphabetisch.
+    pub fn media(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(self.effective_folder())
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && is_video(p)).collect())
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && is_media(p)).collect())
             .unwrap_or_default();
         v.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
         v
@@ -331,7 +347,7 @@ impl Library {
 pub struct Wallpaper {
     /// "all", "primary" oder Monitor-Nummer ab 1 (von links nach rechts).
     pub monitor: MonitorSel,
-    /// Pfad zur Videodatei (MP4/WebM/MKV …). Leer = Monitor bleibt beim normalen Hintergrund.
+    /// Pfad zur Video- oder Bilddatei (MP4/WebM/MKV …, JPEG/PNG …). Leer = Monitor bleibt beim normalen Hintergrund.
     pub video: PathBuf,
     /// "cover" (füllen, beschneiden), "contain" (einpassen) oder "stretch".
     pub fit: Fit,
@@ -842,6 +858,9 @@ mode = 'radar'
         assert!(is_video(Path::new("a.MP4")));
         assert!(!is_video(Path::new("a.txt")));
         assert!(!is_video(Path::new("mp4")));
+        assert!(is_image(Path::new("Foto.JPG")) && is_image(Path::new("a.tiff")));
+        assert!(!is_image(Path::new("a.mp4")) && !is_video(Path::new("a.png")));
+        assert!(is_media(Path::new("a.webm")) && is_media(Path::new("a.png")) && !is_media(Path::new("a.txt")));
     }
 
     #[test]

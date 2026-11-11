@@ -51,6 +51,7 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `app.rs` | Lebenszyklus, Pause-Entscheidung, Bildtakt | nein (nutzt `platform::sys`) |
 | `render.rs` + `shader.wgsl` | NV12→RGB, Skalierung, Effekte in **einem** Shader-Durchlauf | nein (wgpu) |
 | `video/mod.rs` | Wiedergabe-Uhr, Bildauswahl, Puffer-Recycling | nein |
+| `video/image.rs` | Standbild als Video mit einem Frame: Zielgröße, RGBA → NV12 (BT.709) | nein (Bild lesen über `platform::sys`) |
 | `video/mf.rs` | Dekoder | **ja** (Windows) |
 | `audio/mod.rs` | FFT-Analyse, Auto-Gain, Glättung | nein |
 | `audio/scope.rs` | Messdaten für den Signal Analyzer: Stereo-Samples, 48-Band-Spektrum in dBFS, Spitzenwerte | nein |
@@ -141,7 +142,9 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
 
 - **Keine Codeausführung aus Inhalten**: Es werden ausschließlich Videodateien gelesen. Kein HTML, JS, Lua, Shader-Upload.
 - **Parser = Windows-Komponente**: Container/Codecs parst Media Foundation, das Microsoft per Windows Update patcht.
-  Veyra selbst enthält keinen Medienparser.
+  Veyra selbst enthält keinen Medienparser. Bild-Wallpaper liest die Windows Imaging Component – ausdrücklich nur
+  mit den eingebauten Microsoft-Decodern (JPEG, PNG, BMP, GIF, TIFF; Format an der Signatur erkannt, Datei höchstens
+  256 MB, Bild höchstens 16 384 Pixel je Seite); nachinstallierte Codecs kommen nie zum Zug.
 - **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. `MFSTARTUP_NOSOCKET` verhindert zusätzlich,
   dass Media Foundation Netzwerkquellen öffnet.
   **Einzige Ausnahmen: Flight Control, DSN Now und ISS Tracker** (alle standardmäßig aus). Nur solange Flight Control aktiv ist, läuft ein Thread, der

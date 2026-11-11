@@ -19,13 +19,15 @@ Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschle
 ## Features
 
 - 🎬 **Video-Wallpaper** – MP4/H.264, H.265/HEVC, VP9, AV1 (alles, was Windows' Media Foundation kann), in Endlosschleife
+- 🏞️ **Bild-Wallpaper** – JPEG, PNG, BMP, GIF und TIFF, gelesen mit den eingebauten Windows-Decodern; ein Standbild
+  kostet nach dem Laden praktisch keine Rechenzeit, Widgets und Audio-Effekte funktionieren genauso
 - ⚡ **Hardware-Dekodierung** über die GPU – Ton wird nie dekodiert
 - 🚀 **Zero-Copy** – dekodierte Bilder bleiben im Grafikspeicher und werden direkt gezeichnet (DX12)
 - 🖥️ **Multi-Monitor** – pro Bildschirm ein eigenes Video oder ein Video für alle (wird dann nur einmal dekodiert)
 - ⏸️ **Auto-Pause** bei Vollbild-Spielen/-Videos, maximierten Fenstern (optional), Akkubetrieb und Sperrbildschirm
 - 🔊 **Audio-reaktiv** – Effekte `pulse`, `glow` und `chroma` reagieren auf den Systemsound (WASAPI-Loopback)
-- 🖼️ **Einstellungsfenster** – Monitore in echter Anordnung mit Vorschau, Video per Klick, Dateidialog oder Drag & Drop
-- 📚 **Video-Bibliothek** – ein Ordner (Standard: „Videos“), dessen Videos mit Vorschaubild zur Auswahl stehen
+- 🖼️ **Einstellungsfenster** – Monitore in echter Anordnung mit Vorschau, Video oder Bild per Klick, Dateidialog oder Drag & Drop
+- 📚 **Bibliothek** – ein Ordner (Standard: „Videos“), dessen Videos und Bilder mit Vorschaubild zur Auswahl stehen
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
@@ -62,7 +64,7 @@ Videos effizient als Hintergrund abspielen.
 
 | | Veyra |
 |---|---|
-| Laufzeit | Kein Browser, nur Videodateien |
+| Laufzeit | Kein Browser, nur Video- und Bilddateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
 | Netzwerk | Keiner – außer du schaltest Flight Control, DSN Now oder den ISS Tracker ein (dann nur fest eingebaute Adressen) |
 | Codebasis | ~10.500 Zeilen Rust, 11 direkte Abhängigkeiten |
@@ -98,8 +100,8 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
 1. `veyra.exe` starten – es erscheint ein Symbol im Infobereich der Taskleiste.
 2. Rechtsklick → **Einstellungen…** öffnet das Einstellungsfenster:
    - oben deine Monitore in ihrer echten Anordnung, mit Vorschau des jeweiligen Videos,
-   - „Ein Video für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video zu geben,
-   - Video per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
+   - „Ein Wallpaper für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video oder Bild zu geben,
+   - Video oder Bild per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
    - unter **Widgets**: Uhr, Flight Control, Deep Space Clock, Signal Analyzer, DSN Now und ISS Tracker einschalten
      und per Klick auf den Mini-Monitor platzieren,
    - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
@@ -155,7 +157,7 @@ fit = "cover"
 effect = "pulse"
 intensity = 1.0
 
-[[wallpaper]]            # Monitor 2 bekommt ein eigenes Video
+[[wallpaper]]            # Monitor 2 bekommt ein eigenes Video (oder Bild: video = '…\nebel.jpg')
 monitor = 2
 video = 'D:\Wallpaper\stadt-nacht.mp4'
 effect = "none"

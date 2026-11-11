@@ -1,4 +1,5 @@
 //! Video: Dekoder-Thread (pro Datei einmal, auch wenn mehrere Monitore sie zeigen) + Wiedergabe-Uhr.
+//! Standbilder laufen durch dieselbe Pipeline – als Video mit einem einzigen Frame (siehe [`image`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,12 +7,21 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod image;
 #[cfg(windows)]
 mod mf;
 
-/// Vorschaubild als RGBA (Breite, Höhe, Pixel) – für das Einstellungsfenster.
+/// Vorschaubild als RGBA (Breite, Höhe, Pixel), höchstens `max_w` breit – für das Einstellungsfenster.
 #[cfg(windows)]
-pub use mf::thumbnail;
+pub fn thumbnail(path: &Path, max_w: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    if crate::config::is_image(path) {
+        return crate::platform::sys::decode_image_file(path, |w, h| {
+            let k = (max_w as f32 / w as f32).min(1.0);
+            (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1))
+        });
+    }
+    mf::thumbnail(path, max_w)
+}
 
 /// Ein dekodiertes Bild im NV12-Format (Y-Ebene, danach verschachtelte UV-Ebene).
 /// NV12 ist das native Ausgabeformat der Hardware-Dekoder und halb so groß wie RGBA.
@@ -203,8 +213,13 @@ fn spawn_decoder(path: PathBuf, opts: DecodeOptions, tx: SyncSender<Frame>, pool
     std::thread::Builder::new()
         .name("video-decoder".into())
         .spawn(move || {
-            if let Err(e) = mf::decode_loop(&path, opts, &tx, &pool, &stop) {
-                log::error!("Video {path:?}: {e:?}");
+            let r = if crate::config::is_image(&path) {
+                image::show(&path, opts, &tx, &pool, &stop)
+            } else {
+                mf::decode_loop(&path, opts, &tx, &pool, &stop)
+            };
+            if let Err(e) = r {
+                log::error!("Wallpaper {path:?}: {e:?}");
             }
         })
         .expect("Dekoder-Thread starten");
@@ -237,6 +252,28 @@ mod tests {
         assert_eq!(p.next_due(), Some(Duration::from_millis(16)));
         p.advance(Duration::from_millis(10));
         assert_eq!(p.next_due(), Some(Duration::from_millis(6)));
+    }
+
+    /// Durch die echte Pipeline: Bilddatei → WIC → NV12 → genau ein Frame, verkleinert auf den „Monitor“.
+    #[cfg(windows)]
+    #[test]
+    fn image_becomes_single_frame() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("veyra-logo.png");
+        let mut p = Player::open(&path, DecodeOptions { max_size: Some((64, 36)), ..Default::default() });
+        let start = std::time::Instant::now();
+        while p.next_due().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "kein Bild vom Dekoder");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let f = p.take_due().unwrap();
+        assert!(f.width.is_multiple_of(2) && f.height.is_multiple_of(2));
+        assert!(f.width >= 64 && f.height >= 36 && (f.width == 64 || f.height == 36), "{}×{}", f.width, f.height);
+        assert_eq!(f.data.len(), (f.width * f.height * 3 / 2) as usize);
+        // Danach kommt nichts mehr – und der Dekoder gilt nicht als abgestürzt.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(p.next_due().is_none() && !p.failed);
+        let (w, _, rgba) = thumbnail(&path, 100).unwrap();
+        assert!(w <= 100 && !rgba.is_empty());
     }
 
     #[test]
