@@ -1,6 +1,5 @@
 //! Text für die Widgets: Orbitron (eingebettet, SIL Open Font License), gerastert mit `ab_glyph`.
 
-use super::canvas::{Canvas, Image, Layer};
 use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, VariableFont};
 
 static ORBITRON: &[u8] = include_bytes!("../../assets/Orbitron.ttf");
@@ -39,13 +38,11 @@ pub struct Line {
     pub tracking: f32,
     /// Ziffern gleich breit (Uhr, Countdown springen sonst hin und her).
     pub tabular: bool,
-    /// Abstand zur vorigen Zeile.
-    pub gap: f32,
 }
 
 impl Line {
     pub fn new(size: f32, weight: Weight) -> Self {
-        Self { spans: Vec::new(), size, weight, tracking: 0.0, tabular: false, gap: 0.0 }
+        Self { spans: Vec::new(), size, weight, tracking: 0.0, tabular: false }
     }
 
     pub fn span(mut self, text: impl Into<String>, color: Color) -> Self {
@@ -60,11 +57,6 @@ impl Line {
 
     pub fn tabular(mut self) -> Self {
         self.tabular = true;
-        self
-    }
-
-    pub fn gap(mut self, g: f32) -> Self {
-        self.gap = g;
         self
     }
 }
@@ -116,7 +108,6 @@ pub struct Laid {
     pub glyphs: Vec<Placed>,
     pub width: f32,
     pub ascent: f32,
-    pub height: f32,
     pub px: f32,
 }
 
@@ -148,32 +139,12 @@ pub fn layout(fonts: &Fonts, line: &Line, scale: f32) -> Laid {
         }
     }
     let width = if glyphs.is_empty() { 0.0 } else { x - track };
-    Laid { glyphs, width, ascent: sf.ascent(), height: sf.ascent() - sf.descent(), px }
+    Laid { glyphs, width, ascent: sf.ascent(), px }
 }
 
 /// Breite einer Zeile in Pixeln.
 pub fn width(fonts: &Fonts, line: &Line, scale: f32) -> f32 {
     layout(fonts, line, scale).width
-}
-
-/// Zeilen untereinander setzen und mit Schatten rastern (Uhr).
-pub fn render(fonts: &Fonts, lines: &[Line], align: Align, scale: f32) -> Image {
-    let laid: Vec<Laid> = lines.iter().map(|l| layout(fonts, l, scale)).collect();
-    let content_w = laid.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
-    let content_h = lines.iter().zip(&laid).map(|(l, d)| l.gap * scale + d.height).sum::<f32>().ceil();
-    let mut c = Canvas::new(content_w as u32, content_h as u32, scale);
-    let mut y = 0.0;
-    for (l, d) in lines.iter().zip(&laid) {
-        y += l.gap * scale;
-        let x = match align {
-            Align::Left => 0.0,
-            Align::Center => ((content_w - d.width) / 2.0).round(),
-            Align::Right => content_w - d.width,
-        };
-        c.text(Layer::Fore, fonts, l, scale, x, y);
-        y += d.height;
-    }
-    c.finish(scale)
 }
 
 #[cfg(test)]
@@ -197,16 +168,5 @@ mod tests {
         let f = Fonts::new();
         let w = |t: &str| width(&f, &Line::new(48.0, Weight::Bold).tabular().span(t, WHITE), 1.0);
         assert_eq!(w("11:11:11"), w("00:00:08"));
-    }
-
-    #[test]
-    fn renders_something() {
-        let f = Fonts::new();
-        let img = render(&f, &[Line::new(40.0, Weight::Bold).span("T- 01:02:03", WHITE)], Align::Right, 1.0);
-        assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
-        assert!(img.width > 2 * img.pad && img.height > 2 * img.pad);
-        assert!(img.rgba.chunks_exact(4).any(|p| p[0] > 200 && p[3] > 200), "weiße Schrift vorhanden");
-        assert!(img.rgba.chunks_exact(4).all(|p| p[0] <= p[3]), "vormultipliziert");
-        assert!(img.glow.is_empty());
     }
 }

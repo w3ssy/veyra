@@ -9,6 +9,7 @@
 pub mod analyzer;
 pub mod astro;
 pub mod canvas;
+pub mod clockface;
 pub mod dsn;
 pub mod dsnnow;
 pub mod flight;
@@ -26,10 +27,7 @@ use crate::platform::sys;
 use canvas::Image;
 use flight::Fx;
 use launch::{Feed, View};
-use text::{Align, Color, Fonts, Line, Weight, WHITE};
-use time::{DateTime, MONTHS, WEEKDAYS};
-
-const SOFT: Color = [255, 255, 255, 225];
+use text::{Align, Fonts};
 
 /// Abstand zum Rand des Arbeitsbereichs bei Skalierung 1.
 const MARGIN: f32 = 28.0;
@@ -39,7 +37,7 @@ const STACK_GAP: f32 = 10.0;
 /// Ein Widget mit allem, was es gerade zeigt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Widget {
-    Clock(Vec<Line>),
+    Clock(Box<clockface::Clock>),
     Flight(Box<flight::Flight>),
     SpaceClock(Box<spaceclock::SpaceClock>),
     Analyzer(analyzer::Analyzer),
@@ -131,7 +129,7 @@ impl Widgets {
             None => out.push((pos, vec![w])),
         };
         if cfg.clock.enabled {
-            add(cfg.clock.position, Widget::Clock(clock(&cfg.clock, sys::local_time(now))));
+            add(cfg.clock.position, Widget::Clock(Box::new(clockface::content(&cfg.clock, sys::local_time(now), now))));
         }
         if cfg.flight_control.enabled {
             let view = self.feed.as_ref().map_or(View::Waiting, |f| f.view(now));
@@ -167,7 +165,7 @@ impl Widgets {
             .iter()
             .enumerate()
             .map(|(i, w)| match w {
-                Widget::Clock(lines) => text::render(&self.fonts, lines, align, scale),
+                Widget::Clock(k) => clockface::render(k, &self.fonts, scale),
                 Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache, width),
                 Widget::SpaceClock(c) => spaceclock::render(c, &self.fonts, scale, width),
                 Widget::Dsn(d) => dsnnow::render(d, &self.fonts, scale, width),
@@ -251,23 +249,6 @@ pub fn place(pos: Position, img: &Image, surface: (u32, u32), insets: [i32; 4], 
     };
     let (col, row) = pos.grid();
     (axis(col, surface.0, insets[0], insets[2], img.width), axis(row, surface.1, insets[1], insets[3], img.height))
-}
-
-fn two(n: u32) -> String {
-    format!("{n:02}")
-}
-
-fn clock(cfg: &config::ClockWidget, t: DateTime) -> Vec<Line> {
-    let mut time = format!("{}:{}", two(t.hour), two(t.minute));
-    if cfg.seconds {
-        time += &format!(":{}", two(t.second));
-    }
-    let mut lines = vec![Line::new(96.0, Weight::Bold).span(time, WHITE).tabular().tracking(0.03)];
-    if cfg.date {
-        let date = format!("{}, {}. {} {}", WEEKDAYS[t.weekday as usize], t.day, MONTHS[t.month as usize - 1], t.year);
-        lines.push(Line::new(17.0, Weight::Medium).span(date, SOFT).tracking(0.22).gap(8.0));
-    }
-    lines
 }
 
 #[cfg(test)]

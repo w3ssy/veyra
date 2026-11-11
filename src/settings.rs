@@ -805,10 +805,10 @@ impl Settings {
 
         ui.add_space(14.0);
         widget_card(ui, "clock", &mut wd.clock.enabled, &mut wd.clock.position, &others("clock"), |ui, enabled| {
-            title(ui, "Uhr", "Uhrzeit groß, darunter das Datum.", enabled);
+            title(ui, "Uhr", "Die Ortszeit als Herzstück: große Ziffern mit Leuchtschein, 24-Stunden-Leiste, Datum und Telemetrie (UTC, Tag im Jahr, Kalenderwoche).", enabled);
         }, |ui| {
             ui.checkbox(&mut wd.clock.seconds, "Sekunden anzeigen");
-            ui.checkbox(&mut wd.clock.date, "Datum anzeigen");
+            ui.checkbox(&mut wd.clock.date, "Datum und Telemetrie anzeigen");
         });
 
         ui.add_space(12.0);

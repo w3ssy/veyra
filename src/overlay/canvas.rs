@@ -196,6 +196,40 @@ impl Canvas {
         laid.width
     }
 
+    /// Weicher, dauerhafter Schein hinter einer Textzeile (Hintergrund-Ebene, also ohne Schatten):
+    /// Schrift unscharf zeichnen, Deckkraft × `strength`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn halo(&mut self, fonts: &Fonts, line: &Line, scale: f32, x: f32, y: f32, radius: f32, strength: f32, color: Color) {
+        let laid = text::layout(fonts, line, scale);
+        let font = fonts.get(line.weight);
+        let (w, h) = (self.w as usize, self.h as usize);
+        let mut cov = vec![0.0f32; w * h];
+        let baseline = (y + self.oy + laid.ascent).round();
+        for g in &laid.glyphs {
+            let Some(outline) = font.outline_glyph(g.id.with_scale_and_position(laid.px, point((x + self.ox + g.x).round(), baseline))) else {
+                continue;
+            };
+            let b = outline.px_bounds();
+            outline.draw(|gx, gy, c| {
+                let (px, py) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
+                if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h {
+                    let v = &mut cov[py as usize * w + px as usize];
+                    *v = (*v + c).min(1.0);
+                }
+            });
+        }
+        let r = (radius * scale).max(1.0) as usize;
+        for _ in 0..3 {
+            box_blur(&mut cov, w, h, r);
+        }
+        let c = premul(color);
+        for (i, v) in cov.iter().enumerate() {
+            if *v > 0.002 {
+                Self::put(&mut self.back, self.w, self.h, (i % w) as i32, (i / w) as i32, c, v * strength);
+            }
+        }
+    }
+
     /// Ebenen zusammenführen: Hintergrund, Schatten der Vordergrund-Ebene, Vordergrund.
     pub fn finish(self, scale: f32) -> Image {
         let r = shadow_radius(scale);

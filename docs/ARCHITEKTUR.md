@@ -62,7 +62,8 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `overlay/text.rs` | Orbitron (eingebettet) mit `ab_glyph` setzen, gleich breite Ziffern | nein |
 | `overlay/flight.rs` | Mission-Control-Modul: Layout, Raketen-Scan (Kantenbild), Patch-Ring, Countdown-Phasen | nein |
 | `overlay/launch.rs` | Flight Control: Launch Library 2 abfragen, Bilder laden, zwischenspeichern, nächsten Start wählen | nein (HTTPS und Bild-Dekodierung über `platform::sys`) |
-| `overlay/hud.rs` | Gemeinsame HUD-Bausteine: Kopfzeile mit Status-Lampen, Datenzeilen | nein |
+| `overlay/hud.rs` | Gemeinsame HUD-Bausteine: Panel (Glasplatte mit Rahmen), Kopfzeile mit Status-Lampen, Datenzeilen | nein |
+| `overlay/clockface.rs` | Uhr: Ortszeit mit Leuchtschein, 24-Stunden-Leiste, Datum, UTC/Tag/Kalenderwoche | nein |
 | `overlay/astro.rs` | Julianisches Datum, Sternzeit (IAU 1982), Mars-Zeit nach Allison & McEwen (Mars24) | nein |
 | `overlay/spaceclock.rs` | Deep Space Clock: Layout, Zifferblatt Erdtag/Marssol | nein |
 | `overlay/analyzer.rs` | Signal Analyzer: Rahmen/Raster (1×/s) und Phosphor-Schirm (pro Bild, mit Nachleuchten) | nein |

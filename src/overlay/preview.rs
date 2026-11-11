@@ -160,6 +160,11 @@ fn preview() {
     let img = dsnnow::render(&dsn_now, &fonts, 1.0, dsnnow::WIDTH);
     write_png(&dir.join("dsn_now.png"), img.width, img.height, &compose(&img, None));
 
+    let clock_cfg = crate::config::ClockWidget { enabled: true, seconds: true, date: true, ..Default::default() };
+    let clock = super::clockface::content(&clock_cfg, crate::platform::sys::local_time(now), now);
+    let img = super::clockface::render(&clock, &fonts, 1.0);
+    write_png(&dir.join("clock.png"), img.width, img.height, &compose(&img, None));
+
     let mut cache = flight::Cache::default();
     let fl = flight::content(rocket(now + 21_447), now);
     let img = flight::render(&fl, &fonts, 1.0, &mut cache, flight::WIDTH);
@@ -176,6 +181,7 @@ fn preview() {
                 (Position::TopRight, vec![dsc.clone()]),
                 (Position::BottomLeft, vec![Widget::Flight(Box::new(fl.clone()))]),
                 (Position::BottomRight, vec![ana.clone()]),
+                (Position::Center, vec![Widget::Clock(Box::new(clock.clone()))]),
             ],
         ),
         (
