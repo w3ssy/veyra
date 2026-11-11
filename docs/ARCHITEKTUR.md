@@ -203,7 +203,9 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
    *(Erledigt: Einstellungsfenster mit Monitor-Übersicht und Video-Bibliothek, Pause bei ausgeschaltetem Bildschirm,
    Wächter für die Desktop-Einbettung, Release-Builds per GitHub Actions.)* *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
    ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*
-3. **v0.3 (dieser Stand)**: Zero-Copy-Pfad *(erledigt)*; Widgets Uhr und Flight Control (Mission-Control-Modul mit
-   Countdown-Effekten) *(erledigt)*; Deep Space Clock, Signal Analyzer, DSN Now und ISS Tracker *(erledigt)*;
+3. **v0.3**: Zero-Copy-Pfad *(erledigt)*; Widgets Uhr und Flight Control (Mission-Control-Modul mit
+   Countdown-Effekten) *(erledigt)*.
+4. **v0.4 (dieser Stand)**: Widgets als Dashboard (gemeinsames Panel), Uhr als Mission-Control-Herzstück,
+   Deep Space Clock, Signal Analyzer, DSN Now und ISS Tracker; Bilder als Wallpaper *(erledigt)*;
    offen: `gpu = "auto"` nach Monitor-Anschluss.
-4. **v0.4**: Linux (Wayland zuerst).
+5. **v0.5**: Linux (Wayland zuerst).
