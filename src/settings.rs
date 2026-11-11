@@ -3,7 +3,7 @@
 //! Es liest und schreibt ausschließlich `config.toml` – der Hintergrund-Prozess erkennt die Änderung
 //! und übernimmt sie. Ist das Fenster zu, kostet es nichts; stürzt es ab, läuft das Wallpaper weiter.
 
-use crate::config::{self, Backend, Config, Effect, Fit, GpuPreference, MonitorSel, Position, Wallpaper};
+use crate::config::{self, AnalyzerMode, Backend, Config, Effect, Fit, GpuPreference, MonitorSel, Position, Wallpaper};
 use crate::platform::sys::{self, Monitor};
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2};
@@ -343,7 +343,7 @@ fn widget_card(
     id: &str,
     enabled: &mut bool,
     pos: &mut Position,
-    other: Option<Position>,
+    others: &[Position],
     head: impl FnOnce(&mut egui::Ui, &mut bool),
     options: impl FnOnce(&mut egui::Ui),
 ) {
@@ -356,7 +356,7 @@ fn widget_card(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.add_enabled_ui(*enabled, |ui| position_picker(ui, id, pos, other));
+                    ui.add_enabled_ui(*enabled, |ui| position_picker(ui, id, pos, others));
                     ui.label(RichText::new(pos.label()).color(if *enabled { CYAN } else { Color32::GRAY }));
                 });
                 ui.add_space(16.0);
@@ -368,8 +368,8 @@ fn widget_card(
         });
 }
 
-/// Mini-Monitor mit 3 × 3 Plätzen; Klick wählt den Platz. `other` = Platz eines anderen Widgets (grau).
-fn position_picker(ui: &mut egui::Ui, id: &str, pos: &mut Position, other: Option<Position>) {
+/// Mini-Monitor mit 3 × 3 Plätzen; Klick wählt den Platz. `others` = Plätze der anderen aktiven Widgets (grau).
+fn position_picker(ui: &mut egui::Ui, id: &str, pos: &mut Position, others: &[Position]) {
     let size = Vec2::new(176.0, 99.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_text(format!("Position wählen ({id})"));
@@ -410,7 +410,7 @@ fn position_picker(ui: &mut egui::Ui, id: &str, pos: &mut Position, other: Optio
         let hovered = hover.is_some_and(|h| cell(p).contains(h));
         if p == *pos {
             painter.rect_filled(m, CornerRadius::same(3), if enabled { ACCENT } else { Color32::from_gray(90) });
-        } else if Some(p) == other {
+        } else if others.contains(&p) {
             painter.rect_filled(m, CornerRadius::same(3), Color32::from_gray(60));
         } else {
             let stroke = if hovered { Stroke::new(1.5, CYAN) } else { Stroke::new(1.0, Color32::from_gray(55)) };
@@ -780,38 +780,115 @@ impl Settings {
             );
         }
 
-        let (clock_pos, fc_pos) = (wd.clock.position, wd.flight_control.position);
-        let (clock_on, fc_on) = (wd.clock.enabled, wd.flight_control.enabled);
-
-        ui.add_space(14.0);
-        widget_card(ui, "clock", &mut wd.clock.enabled, &mut wd.clock.position, fc_on.then_some(fc_pos), |ui, enabled| {
-            ui.label(RichText::new("Uhr").size(17.0).strong().color(Color32::WHITE));
-            ui.label(RichText::new("Uhrzeit groß, darunter das Datum.").color(Color32::GRAY));
+        // Plätze aller aktiven Widgets – jede Karte zeigt die der anderen grau an.
+        let taken: Vec<(&str, Position)> = [
+            ("clock", wd.clock.enabled, wd.clock.position),
+            ("flight", wd.flight_control.enabled, wd.flight_control.position),
+            ("dsc", wd.deep_space_clock.enabled, wd.deep_space_clock.position),
+            ("analyzer", wd.signal_analyzer.enabled, wd.signal_analyzer.position),
+            ("dsn", wd.dsn.enabled, wd.dsn.position),
+        ]
+        .into_iter()
+        .filter(|(_, on, _)| *on)
+        .map(|(id, _, p)| (id, p))
+        .collect();
+        let others = |me: &str| -> Vec<Position> { taken.iter().filter(|(id, _)| *id != me).map(|(_, p)| *p).collect() };
+        let title = |ui: &mut egui::Ui, t: &str, desc: &str, enabled: &mut bool| {
+            ui.label(RichText::new(t).size(17.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new(desc).color(Color32::GRAY));
             ui.add_space(4.0);
             ui.checkbox(enabled, "Aktiv");
+        };
+        let note = |ui: &mut egui::Ui, t: &str| {
+            ui.label(RichText::new(t).small().color(Color32::GRAY));
+        };
+
+        ui.add_space(14.0);
+        widget_card(ui, "clock", &mut wd.clock.enabled, &mut wd.clock.position, &others("clock"), |ui, enabled| {
+            title(ui, "Uhr", "Uhrzeit groß, darunter das Datum.", enabled);
         }, |ui| {
             ui.checkbox(&mut wd.clock.seconds, "Sekunden anzeigen");
             ui.checkbox(&mut wd.clock.date, "Datum anzeigen");
         });
 
         ui.add_space(12.0);
-        widget_card(ui, "flight", &mut wd.flight_control.enabled, &mut wd.flight_control.position, clock_on.then_some(clock_pos), |ui, enabled| {
-            ui.label(RichText::new("Flight Control").size(17.0).strong().color(Color32::WHITE));
-            ui.label(
-                RichText::new("Der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit Terminal Count und Liftoff, Raketen-Scan, Mission-Patch, Startplatz.")
-                    .color(Color32::GRAY),
+        widget_card(ui, "flight", &mut wd.flight_control.enabled, &mut wd.flight_control.position, &others("flight"), |ui, enabled| {
+            title(
+                ui,
+                "Flight Control",
+                "Der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit Terminal Count und Liftoff, Raketen-Scan, Mission-Patch, Startplatz.",
+                enabled,
             );
-            ui.add_space(4.0);
-            ui.checkbox(enabled, "Aktiv");
         }, |ui| {
-            ui.label(
-                RichText::new(
-                    "Einzige Funktion mit Internetzugriff: lädt alle 15 Minuten öffentliche Startdaten von ll.thespacedevs.com \
-                     (Launch Library 2 von The Space Devs), dazu Raketenfoto und Mission-Patch der nächsten Starts. \
-                     Gesendet wird nur die Anfrage selbst; ist das Widget aus, gibt es keinen Netzwerkzugriff.",
-                )
-                .small()
-                .color(Color32::GRAY),
+            note(
+                ui,
+                "Mit Internetzugriff: lädt alle 15 Minuten öffentliche Startdaten von ll.thespacedevs.com \
+                 (Launch Library 2 von The Space Devs), dazu Raketenfoto und Mission-Patch der nächsten Starts. \
+                 Gesendet wird nur die Anfrage selbst; ist das Widget aus, gibt es keinen Netzwerkzugriff.",
+            );
+        });
+
+        ui.add_space(12.0);
+        let dsc = &mut wd.deep_space_clock;
+        widget_card(ui, "dsc", &mut dsc.enabled, &mut dsc.position, &others("dsc"), |ui, enabled| {
+            title(
+                ui,
+                "Deep Space Clock",
+                "Die Zeit wie in Mission Control: UTC, Julianisches Datum, Sternzeit – und die Mars-Zeit samt Ortszeit und Sol der Rover Curiosity und Perseverance.",
+                enabled,
+            );
+        }, |ui| {
+            let mut local = dsc.longitude.is_some();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut local, "Ortssternzeit für Längengrad")
+                    .on_hover_text("Ohne Längengrad zeigt die Uhr die Greenwich-Sternzeit (GMST)");
+                let mut lon = dsc.longitude.unwrap_or(10.0);
+                ui.add_enabled(local, egui::DragValue::new(&mut lon).range(-180.0..=180.0).speed(0.05).fixed_decimals(2).suffix("° O"))
+                    .on_hover_text("Osten positiv, Westen negativ (Berlin 13,40 · Wien 16,37 · Zürich 8,54)");
+                dsc.longitude = local.then_some(lon);
+            });
+            ui.checkbox(&mut dsc.mars, "Mars-Zeit und Rover anzeigen");
+            note(ui, "Wird vollständig lokal berechnet – kein Netzwerk.");
+        });
+
+        ui.add_space(12.0);
+        let sa = &mut wd.signal_analyzer;
+        widget_card(ui, "analyzer", &mut sa.enabled, &mut sa.position, &others("analyzer"), |ui, enabled| {
+            title(
+                ui,
+                "Signal Analyzer",
+                "Der Systemsound auf einem Messgerät mit grün nachleuchtendem Phosphor-Schirm: Spektrum, Oszilloskop oder XY-Goniometer.",
+                enabled,
+            );
+        }, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Anzeige");
+                egui::ComboBox::from_id_salt("analyzer_mode").width(180.0).selected_text(sa.mode.label()).show_ui(ui, |ui| {
+                    for m in AnalyzerMode::ALL {
+                        ui.selectable_value(&mut sa.mode, m, m.label());
+                    }
+                });
+            });
+            note(
+                ui,
+                "Liest den Systemsound lokal mit (wie die audio-reaktiven Effekte) – nichts wird gespeichert oder versendet. \
+                 Nur die Leuchtspur wird pro Bild gezeichnet; bei Stille ruht das Widget.",
+            );
+        });
+
+        ui.add_space(12.0);
+        widget_card(ui, "dsn", &mut wd.dsn.enabled, &mut wd.dsn.position, &others("dsn"), |ui, enabled| {
+            title(
+                ui,
+                "DSN Now",
+                "Live aus dem NASA Deep Space Network: welche Antenne in Goldstone, Madrid und Canberra gerade mit welcher Raumsonde funkt – mit Datenrate, Signallaufzeit und Entfernung.",
+                enabled,
+            );
+        }, |ui| {
+            note(
+                ui,
+                "Mit Internetzugriff: lädt jede Minute den öffentlichen Antennenstatus von eyes.nasa.gov (nur lesend). \
+                 Gesendet wird nur die Anfrage selbst; ist das Widget aus, gibt es keinen Netzwerkzugriff.",
             );
         });
     }

@@ -12,8 +12,8 @@
 |---|---|
 | Eingebetteter Chromium (CEF) für Web-Wallpaper: ~100–300 MB RAM pro Instanz, großer Angriffsvektor | Kein Browser. Nur Videodateien. |
 | JavaScript/„SceneScript“ aus dem Workshop führt fremden Code aus | Kein Skripting, keine Plugins, keine Workshop-Downloads |
-| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahme: Flight Control (zwei feste HTTPS-Adressen, nur lesend) |
-| Große Codebasis, viele Drittbibliotheken | ~7.000 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
+| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahmen: Flight Control und DSN Now (feste HTTPS-Adressen, nur lesend) |
+| Große Codebasis, viele Drittbibliotheken | ~9.300 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
 | Rendert oft dauerhaft mit voller Bildrate | Zeichnet nur, wenn ein neues Videobild fällig ist |
 
 ## Aufbau
@@ -53,6 +53,7 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `video/mod.rs` | Wiedergabe-Uhr, Bildauswahl, Puffer-Recycling | nein |
 | `video/mf.rs` | Dekoder | **ja** (Windows) |
 | `audio/mod.rs` | FFT-Analyse, Auto-Gain, Glättung | nein |
+| `audio/scope.rs` | Messdaten für den Signal Analyzer: Stereo-Samples, 48-Band-Spektrum in dBFS, Spitzenwerte | nein |
 | `audio/wasapi.rs` | System-Loopback | **ja** (Windows) |
 | `platform/windows.rs` | Desktop-Einbettung + Wächter, Monitore, Tray, Autostart, Pause-Signale, Dateidialoge | **ja** |
 | `settings.rs` | Einstellungsfenster (egui), Vorschaubilder über `video/mf.rs` | **ja** (Windows) |
@@ -61,12 +62,26 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `overlay/text.rs` | Orbitron (eingebettet) mit `ab_glyph` setzen, gleich breite Ziffern | nein |
 | `overlay/flight.rs` | Mission-Control-Modul: Layout, Raketen-Scan (Kantenbild), Patch-Ring, Countdown-Phasen | nein |
 | `overlay/launch.rs` | Flight Control: Launch Library 2 abfragen, Bilder laden, zwischenspeichern, nächsten Start wählen | nein (HTTPS und Bild-Dekodierung über `platform::sys`) |
+| `overlay/hud.rs` | Gemeinsame HUD-Bausteine: Kopfzeile mit Status-Lampen, Datenzeilen | nein |
+| `overlay/astro.rs` | Julianisches Datum, Sternzeit (IAU 1982), Mars-Zeit nach Allison & McEwen (Mars24) | nein |
+| `overlay/spaceclock.rs` | Deep Space Clock: Layout, Zifferblatt Erdtag/Marssol | nein |
+| `overlay/analyzer.rs` | Signal Analyzer: Rahmen/Raster (1×/s) und Phosphor-Schirm (pro Bild, mit Nachleuchten) | nein |
+| `overlay/dsn.rs` | DSN Now: Antennenstatus abfragen, eigener Mini-XML-Leser, Kürzel → Sondennamen | nein (HTTPS über `platform::sys`) |
+| `overlay/dsnnow.rs` | DSN Now: Tafel mit Link-Richtung, Datenrate, Laufzeit, logarithmischer Entfernungsskala | nein |
 
 **Widgets** kosten fast nichts: Der Inhalt wird höchstens einmal pro Sekunde bestimmt und nur bei einer Änderung
 neu gerastert (Uhr ohne Sekunden: einmal pro Minute). Das fertige Bild liegt als kleine Textur auf der GPU und wird
 im selben Render-Durchlauf wie das Video mit einem Rechteck überblendet. Pausierte Monitore aktualisieren nichts.
 Der Countdown-Effekt (Aufleuchten in den letzten 10 Sekunden, Blitz bei T-0) steckt in einer zweiten, gleich großen
 Textur; der Shader mischt sie mit einer Stärke dazu, die pro Bild berechnet wird – nur dann wird jedes Bild gezeichnet.
+
+Der **Signal Analyzer** ist das einzige Widget mit Bewegung in jedem Bild – und nutzt dafür dieselbe Leucht-Ebene:
+Rahmen, Raster und Beschriftung entstehen wie üblich höchstens einmal pro Sekunde; die Leuchtspur rechnet
+`Phosphor` pro Bild auf der CPU (Strahl mit gleicher Lichtmenge pro Sample, exponentielles Nachleuchten,
+weicher Schein) und lädt nur den Ausschnitt des Schirms in die Leucht-Textur (`Gpu::overlay_glow`). Als reines
+Licht addiert sie sich zum Video. Die Daten liefert der Audio-Thread (`audio/scope.rs`) alle ~16 ms; er läuft nur,
+solange ein sichtbarer Monitor einen Audio-Effekt oder den Analyzer zeigt. Ist nichts zu hören und die Spur
+verblasst, wird wieder nur bei neuen Videobildern gezeichnet.
 
 ## Desktop-Einbettung (Windows)
 
@@ -126,7 +141,7 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
   Veyra selbst enthält keinen Medienparser.
 - **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. `MFSTARTUP_NOSOCKET` verhindert zusätzlich,
   dass Media Foundation Netzwerkquellen öffnet.
-  **Einzige Ausnahme: Flight Control** (standardmäßig aus). Nur solange das Widget aktiv ist, läuft ein Thread, der
+  **Einzige Ausnahmen: Flight Control und DSN Now** (beide standardmäßig aus). Nur solange Flight Control aktiv ist, läuft ein Thread, der
   alle 15 Minuten (in der Stunde vor einem Start alle 6 Minuten) die Liste der nächsten Starts von
   `https://ll.thespacedevs.com/2.3.0/…` abfragt, einmal pro neuem Start dessen Mission-Patch, und Fotos/Patches der
   nächsten zwei Starts aus der Bildablage `https://thespacedevs-prod.nyc3.digitaloceanspaces.com/media/…` lädt.
@@ -137,7 +152,10 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
   Decodern der Windows Imaging Component gelesen – wie bei den Videos parst also eine von Windows Update gepflegte
   Komponente, nachinstallierte Codecs kommen nie zum Zug. Zwischenspeicher: `%APPDATA%\Veyra\cache` (nach 14 Tagen
   ohne Gebrauch gelöscht). Gesendet wird nur die Anfrage mit `User-Agent: Veyra/<Version>`.
-  Prüfbar: `grep -rn "https_get" src/` – aufgerufen wird es nur in `overlay/launch.rs`.
+  **DSN Now** fragt, solange es aktiv ist, einmal pro Minute `https://eyes.nasa.gov/dsn/data/dsn.xml` ab (Antwort auf
+  1 MB begrenzt). Gelesen werden nur Elemente und Attribute mit einem eigenen, minimalen Leser – keine DTDs, keine
+  Entitäten, keine externen Verweise; die Werte landen ausschließlich in Text- und Zahlenfeldern.
+  Prüfbar: `grep -rn "https_get" src/` – aufgerufen wird es nur in `overlay/launch.rs` und `overlay/dsn.rs`.
 - **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra`, `HKCU\…\Run` (Autostart) und – nur wenn in den
   Einstellungen aktiviert – eine Verknüpfung ins eigene Startmenü (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`).
 - **Speichersicher**: Rust; `unsafe` nur an den Grenzen zu Win32/COM, jeweils gekapselt.
@@ -176,5 +194,6 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
    Wächter für die Desktop-Einbettung, Release-Builds per GitHub Actions.)* *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
    ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*
 3. **v0.3 (dieser Stand)**: Zero-Copy-Pfad *(erledigt)*; Widgets Uhr und Flight Control (Mission-Control-Modul mit
-   Countdown-Effekten) *(erledigt)*; offen: `gpu = "auto"` nach Monitor-Anschluss.
+   Countdown-Effekten) *(erledigt)*; Deep Space Clock, Signal Analyzer und DSN Now *(erledigt)*;
+   offen: `gpu = "auto"` nach Monitor-Anschluss.
 4. **v0.4**: Linux (Wayland zuerst).

@@ -592,6 +592,22 @@ impl Gpu {
         ov
     }
 
+    /// Einen Ausschnitt der Leucht-Ebene ersetzen (Leuchtspur des Signal Analyzers, pro Bild).
+    /// `rect` = x, y, Breite, Höhe innerhalb des Widget-Bildes; `rgba` hat genau diese Größe.
+    pub fn overlay_glow(&self, ov: &mut Overlay, rect: (u32, u32, u32, u32), rgba: &[u8]) {
+        let (x, y, w, h) = rect;
+        if w == 0 || h == 0 || x + w > ov.size.0 || y + h > ov.size.1 || rgba.len() != (w * h * 4) as usize {
+            return;
+        }
+        self.dev().queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &ov.glow, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        ov.has_glow = true;
+    }
+
     /// Stärke des Leuchtens setzen (pro Bild, für den Countdown-Effekt). Schreibt nur bei Änderung.
     pub fn set_flash(&self, ov: &Overlay, flash: f32) {
         if (ov.flash.get() - flash).abs() > 1e-3 {

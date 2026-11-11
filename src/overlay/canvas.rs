@@ -103,6 +103,21 @@ impl Canvas {
         });
     }
 
+    /// Achsparalleles Rechteck (`x0, y0, x1, y1`).
+    pub fn rect(&mut self, l: Layer, r: (f32, f32, f32, f32), color: Color) {
+        let (x0, y0, x1, y1) = r;
+        self.shape(l, r, color, |px, py| (x0 - px).max(px - x1).max(y0 - py).max(py - y1));
+    }
+
+    /// HUD-Ecken (wie bei Flight Control) um ein Rechteck.
+    pub fn corners(&mut self, l: Layer, r: (f32, f32, f32, f32), arm: f32, width: f32, color: Color) {
+        let (x0, y0, x1, y1) = r;
+        for (ax, ay, dx, dy) in [(x0, y0, 1.0, 1.0), (x1, y0, -1.0, 1.0), (x0, y1, 1.0, -1.0), (x1, y1, -1.0, -1.0)] {
+            self.line(l, (ax, ay), (ax + dx * arm, ay), width, color);
+            self.line(l, (ax, ay), (ax, ay + dy * arm), width, color);
+        }
+    }
+
     pub fn ring(&mut self, l: Layer, c: (f32, f32), r: f32, width: f32, color: Color) {
         let bounds = (c.0 - r - width, c.1 - r - width, c.0 + r + width, c.1 + r + width);
         self.shape(l, bounds, color, |px, py| (((px - c.0).powi(2) + (py - c.1).powi(2)).sqrt() - r).abs() - width / 2.0);

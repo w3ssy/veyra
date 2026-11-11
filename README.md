@@ -29,19 +29,27 @@ Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschle
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
-- 🕐 **Widgets** – Uhr und **Flight Control** über dem Video, in der Raumfahrt-Schrift Orbitron, jedes Widget
-  an einer von 9 Positionen
+- 🕐 **Widgets** – Uhr, **Flight Control**, **Deep Space Clock**, **Signal Analyzer** und **DSN Now** über dem
+  Video, in der Raumfahrt-Schrift Orbitron, jedes Widget an einer von 9 Positionen
 - 🚀 **Flight Control** – der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit
   *Terminal Count* und *Liftoff*-Effekt, die Rakete als Sensor-Scan, Mission-Patch im Instrumenten-Ring
+- 🛰️ **Deep Space Clock** – UTC, Julianisches Datum, Sternzeit, Mars-Zeit (MTC) und Ortszeit samt Sol der Rover
+  Curiosity und Perseverance, mit Zifferblatt für Erdtag und Marssol – rein rechnerisch, ohne Netzwerk
+- 📈 **Signal Analyzer** – der Systemsound als Messgerät mit grün nachleuchtendem Phosphor-Schirm:
+  Spektrum (48 Bänder mit Spitzenwerten), getriggertes Oszilloskop oder XY-Goniometer
+- 📡 **DSN Now** – live aus dem NASA Deep Space Network: welche Antenne in Goldstone, Madrid und Canberra gerade
+  mit welcher Raumsonde funkt, mit Datenrate, Signallaufzeit und Entfernung auf einer Lichtlaufzeit-Skala
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk¹, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
 Linux ist architektonisch vorbereitet (siehe [docs/ARCHITEKTUR.md](docs/ARCHITEKTUR.md)).
 
-¹ Einzige Ausnahme: das Widget *Flight Control* – standardmäßig aus. Ist es aktiv, fragt Veyra alle 15 Minuten
-die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi) ab und lädt Raketenfoto und
-Mission-Patch der nächsten Starts aus deren Bildablage (zwei fest eingebaute HTTPS-Adressen, nur lesend).
-Ohne Flight Control gibt es keinen einzigen Netzwerkaufruf.
+¹ Einzige Ausnahmen: die Widgets *Flight Control* und *DSN Now* – beide standardmäßig aus. Ist Flight Control
+aktiv, fragt Veyra alle 15 Minuten die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi)
+ab und lädt Raketenfoto und Mission-Patch der nächsten Starts aus deren Bildablage (zwei fest eingebaute
+HTTPS-Adressen, nur lesend). DSN Now holt einmal pro Minute den öffentlichen Antennenstatus von
+[eyes.nasa.gov](https://eyes.nasa.gov/dsn/dsn.html) (eine fest eingebaute Adresse, nur lesend).
+Ohne diese beiden Widgets gibt es keinen einzigen Netzwerkaufruf.
 
 ## Warum Veyra?
 
@@ -53,8 +61,8 @@ Videos effizient als Hintergrund abspielen.
 |---|---|
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
-| Netzwerk | Keiner – außer du schaltest Flight Control ein (dann nur zwei fest eingebaute Adressen) |
-| Codebasis | ~7.000 Zeilen Rust, 11 direkte Abhängigkeiten |
+| Netzwerk | Keiner – außer du schaltest Flight Control oder DSN Now ein (dann nur fest eingebaute Adressen) |
+| Codebasis | ~9.300 Zeilen Rust, 11 direkte Abhängigkeiten |
 | Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist, Bilder verlassen nie den Grafikspeicher – und pausiert, wenn niemand hinsieht |
 
 ## Download
@@ -89,7 +97,8 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
    - oben deine Monitore in ihrer echten Anordnung, mit Vorschau des jeweiligen Videos,
    - „Ein Video für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video zu geben,
    - Video per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
-   - unter **Widgets**: Uhr und Flight Control einschalten und per Klick auf den Mini-Monitor platzieren,
+   - unter **Widgets**: Uhr, Flight Control, Deep Space Clock, Signal Analyzer und DSN Now einschalten und per
+     Klick auf den Mini-Monitor platzieren,
    - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
 3. **Speichern** (oder Strg+S) – Veyra übernimmt die Änderung sofort.
 
@@ -116,6 +125,21 @@ position = "center"      # top-left, top, top-right, left, center, right, bottom
 [widgets.flight_control]
 enabled = true
 position = "bottom-left"
+
+[widgets.deep_space_clock]
+enabled = true
+position = "top-right"
+longitude = 13.40        # Längengrad für die Ortssternzeit (weglassen = Greenwich)
+mars = true              # Mars-Zeit und Rover
+
+[widgets.signal_analyzer]
+enabled = true
+position = "bottom-right"
+mode = "spectrum"        # "spectrum", "wave" (Oszilloskop) oder "xy" (Goniometer)
+
+[widgets.dsn]
+enabled = true
+position = "top-left"
 
 [[wallpaper]]
 monitor = "all"

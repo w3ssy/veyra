@@ -82,6 +82,9 @@ pub struct Widgets {
     pub scale: f32,
     pub clock: ClockWidget,
     pub flight_control: FlightControlWidget,
+    pub deep_space_clock: DeepSpaceClockWidget,
+    pub signal_analyzer: SignalAnalyzerWidget,
+    pub dsn: DsnWidget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,6 +100,63 @@ pub struct ClockWidget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlightControlWidget {
+    pub enabled: bool,
+    pub position: Position,
+}
+
+/// UTC, Julianisches Datum, Sternzeit und Mars-Zeit – rein rechnerisch, ohne Netzwerk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepSpaceClockWidget {
+    pub enabled: bool,
+    pub position: Position,
+    /// Geografische Länge in Grad (Osten positiv) für die Ortssternzeit; fehlt sie, gilt Greenwich (GMST).
+    pub longitude: Option<f64>,
+    /// Mars-Zeit (MTC) und die Ortszeit der Rover Curiosity und Perseverance zeigen.
+    pub mars: bool,
+}
+
+/// Systemsound als Spektrum, Oszilloskop oder XY-Bild (nur lokal, nichts wird gespeichert).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignalAnalyzerWidget {
+    pub enabled: bool,
+    pub position: Position,
+    pub mode: AnalyzerMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnalyzerMode {
+    Spectrum,
+    Wave,
+    Xy,
+}
+
+impl AnalyzerMode {
+    pub const ALL: [AnalyzerMode; 3] = [AnalyzerMode::Spectrum, AnalyzerMode::Wave, AnalyzerMode::Xy];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnalyzerMode::Spectrum => "spectrum",
+            AnalyzerMode::Wave => "wave",
+            AnalyzerMode::Xy => "xy",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AnalyzerMode::Spectrum => "Spektrum",
+            AnalyzerMode::Wave => "Oszilloskop",
+            AnalyzerMode::Xy => "XY / Goniometer",
+        }
+    }
+}
+
+/// Live-Status des NASA Deep Space Network. Lädt jede Minute Daten von eyes.nasa.gov – standardmäßig aus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DsnWidget {
     pub enabled: bool,
     pub position: Position,
 }
@@ -167,7 +227,15 @@ impl Position {
 
 impl Default for Widgets {
     fn default() -> Self {
-        Self { monitor: MonitorSel::Primary, scale: 1.0, clock: ClockWidget::default(), flight_control: FlightControlWidget::default() }
+        Self {
+            monitor: MonitorSel::Primary,
+            scale: 1.0,
+            clock: ClockWidget::default(),
+            flight_control: FlightControlWidget::default(),
+            deep_space_clock: DeepSpaceClockWidget::default(),
+            signal_analyzer: SignalAnalyzerWidget::default(),
+            dsn: DsnWidget::default(),
+        }
     }
 }
 
@@ -183,9 +251,27 @@ impl Default for FlightControlWidget {
     }
 }
 
+impl Default for DeepSpaceClockWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::TopRight, longitude: None, mars: true }
+    }
+}
+
+impl Default for SignalAnalyzerWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::BottomRight, mode: AnalyzerMode::Spectrum }
+    }
+}
+
+impl Default for DsnWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::TopLeft }
+    }
+}
+
 impl Widgets {
     pub fn any_enabled(&self) -> bool {
-        self.clock.enabled || self.flight_control.enabled
+        self.clock.enabled || self.flight_control.enabled || self.deep_space_clock.enabled || self.signal_analyzer.enabled || self.dsn.enabled
     }
 
     /// Zeigt dieser Monitor die Widgets? (`index` ab 0)
@@ -352,6 +438,8 @@ impl Config {
         self.audio.sensitivity = self.audio.sensitivity.clamp(0.1, 5.0);
         self.audio.smoothing = self.audio.smoothing.clamp(0.0, 0.95);
         self.widgets.scale = self.widgets.scale.clamp(0.5, 2.0);
+        let lon = &mut self.widgets.deep_space_clock.longitude;
+        *lon = lon.filter(|l| l.is_finite()).map(|l| l.clamp(-180.0, 180.0));
         for w in &mut self.wallpapers {
             w.intensity = w.intensity.clamp(0.0, 3.0);
         }
@@ -587,6 +675,25 @@ pub fn render(cfg: &Config) -> String {
     line(format!("enabled = {}", wd.flight_control.enabled), "Nächster Raketenstart (lädt alle 15 min Daten von ll.thespacedevs.com)");
     line(format!("position = \"{}\"", wd.flight_control.position.as_str()), "");
     line(String::new(), "");
+    let dsc = &wd.deep_space_clock;
+    line("[widgets.deep_space_clock]".into(), "");
+    line(format!("enabled = {}", dsc.enabled), "UTC, Julianisches Datum, Sternzeit, Mars-Zeit (nur Rechnen, kein Netzwerk)");
+    line(format!("position = \"{}\"", dsc.position.as_str()), "");
+    match dsc.longitude {
+        Some(lon) => line(format!("longitude = {lon:?}"), "Längengrad (Osten positiv) für die Ortssternzeit"),
+        None => line("# longitude = 13.40".into(), "Längengrad (Osten positiv); ohne Angabe: Greenwich-Sternzeit"),
+    }
+    line(format!("mars = {}", dsc.mars), "Mars-Zeit und Ortszeit der Rover Curiosity/Perseverance");
+    line(String::new(), "");
+    line("[widgets.signal_analyzer]".into(), "");
+    line(format!("enabled = {}", wd.signal_analyzer.enabled), "Systemsound als Messgerät (nur lokal, nichts wird gespeichert)");
+    line(format!("position = \"{}\"", wd.signal_analyzer.position.as_str()), "");
+    line(format!("mode = \"{}\"", wd.signal_analyzer.mode.as_str()), "\"spectrum\", \"wave\" (Oszilloskop) oder \"xy\" (Goniometer)");
+    line(String::new(), "");
+    line("[widgets.dsn]".into(), "");
+    line(format!("enabled = {}", wd.dsn.enabled), "NASA Deep Space Network live (lädt jede Minute Daten von eyes.nasa.gov)");
+    line(format!("position = \"{}\"", wd.dsn.position.as_str()), "");
+    line(String::new(), "");
     line("# Ein Block pro Wallpaper. monitor = \"all\", \"primary\" oder 1, 2, 3 … (von links nach rechts).".into(), "");
     line("# Ein spezifischer Eintrag (Nummer) hat Vorrang vor \"primary\", das wiederum vor \"all\".".into(), "");
     line("# video = '' lässt den Monitor beim normalen Windows-Hintergrund.".into(), "");
@@ -663,6 +770,9 @@ mod tests {
         cfg.widgets.scale = 1.25;
         cfg.widgets.clock = ClockWidget { enabled: true, position: Position::Top, seconds: true, date: false };
         cfg.widgets.flight_control = FlightControlWidget { enabled: true, position: Position::BottomRight };
+        cfg.widgets.deep_space_clock = DeepSpaceClockWidget { enabled: true, position: Position::Left, longitude: Some(-71.0589), mars: false };
+        cfg.widgets.signal_analyzer = SignalAnalyzerWidget { enabled: true, position: Position::Bottom, mode: AnalyzerMode::Xy };
+        cfg.widgets.dsn = DsnWidget { enabled: true, position: Position::Right };
         cfg.wallpapers = vec![
             Wallpaper { video: PathBuf::from(r"C:\Videos\a b.mp4"), ..Default::default() },
             Wallpaper { monitor: MonitorSel::Index(2), video: PathBuf::new(), fit: Fit::Contain, effect: Effect::Glow, intensity: 2.5 },
@@ -687,6 +797,23 @@ mod tests {
         assert_eq!(Position::BottomLeft.grid(), (0, 2));
         assert_eq!(Position::Center.grid(), (1, 1));
         assert!(toml::from_str::<Config>("[widgets.clock]\nposition = 'irgendwo'\n").is_err());
+    }
+
+    #[test]
+    fn new_widgets_defaults_and_limits() {
+        let back: Config = toml::from_str(&render(&Config::default())).unwrap();
+        assert_eq!(back.widgets.deep_space_clock.longitude, None, "auskommentierter Längengrad bleibt leer");
+        let mut cfg: Config = toml::from_str("[widgets.deep_space_clock]
+longitude = 500.0
+[widgets.signal_analyzer]
+mode = 'wave'
+").unwrap();
+        cfg.sanitize();
+        assert_eq!(cfg.widgets.deep_space_clock.longitude, Some(180.0));
+        assert_eq!(cfg.widgets.signal_analyzer.mode, AnalyzerMode::Wave);
+        assert!(toml::from_str::<Config>("[widgets.signal_analyzer]
+mode = 'radar'
+").is_err());
     }
 
     #[test]

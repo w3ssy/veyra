@@ -1,9 +1,9 @@
 //! Die App: verbindet Konfiguration, Fenster, Dekoder, GPU und Audio – und entscheidet,
 //! wann überhaupt gerechnet wird. Grundsatz: Nichts tun, wenn es niemand sieht.
 
-use crate::audio::{AudioCapture, Levels, SharedLevels};
+use crate::audio::{AudioCapture, Levels, Scope, SharedLevels};
 use crate::config::{self, Config, Effect, Position, Wallpaper};
-use crate::overlay::{self, flight::Fx, Widget};
+use crate::overlay::{self, analyzer::Phosphor, flight::Fx, Widget};
 use crate::platform::sys::{self, DesktopHost, Event, HostState, MenuItem, Monitor, Tray, WallpaperWindow};
 use crate::render::{DrawParams, Gpu, Overlay, Target, VideoTex};
 use crate::video::{DecodeOptions, Player};
@@ -47,6 +47,8 @@ struct Panel {
     overlay: Overlay,
     /// Laufender Countdown-Effekt (dann wird jedes Bild gezeichnet).
     fx: Fx,
+    /// Leuchtspur des Signal Analyzers, falls er in diesem Panel steckt (wird pro Bild gezeichnet).
+    live: Option<Phosphor>,
 }
 
 struct PlayerEntry {
@@ -253,11 +255,16 @@ impl App {
         self.cfg.assign(&primary).into_iter().enumerate().filter_map(|(i, w)| w.map(|w| (i, w.clone()))).collect()
     }
 
-    /// Audio nur mitschneiden, wenn ein sichtbarer Monitor einen Effekt nutzt.
+    /// Audio nur mitschneiden, wenn ein sichtbarer Monitor einen Effekt oder den Signal Analyzer zeigt.
     fn update_audio(&mut self) {
-        let needed = self.cfg.needs_audio() && self.slots.iter().any(|s| !s.paused && s.wallpaper.effect != Effect::None);
+        let effects = self.cfg.needs_audio() && self.slots.iter().any(|s| !s.paused && s.wallpaper.effect != Effect::None);
+        let wd = &self.cfg.widgets;
+        let analyzer = wd.signal_analyzer.enabled
+            && self.slots.iter().any(|s| !s.paused && self.monitors.get(s.monitor_index).is_some_and(|m| wd.on_monitor(s.monitor_index, m.primary)));
+        let needed = effects || analyzer;
         if needed && self.audio.is_none() {
-            self.audio = Some(AudioCapture::start(self.levels.clone(), self.cfg.audio.sensitivity, self.cfg.audio.smoothing));
+            let (sens, smooth) = (self.cfg.audio.sensitivity, self.cfg.audio.smoothing);
+            self.audio = Some(AudioCapture::start(self.levels.clone(), self.widgets.scope(), sens, smooth));
         } else if !needed && self.audio.is_some() {
             self.audio = None;
         }
@@ -459,8 +466,15 @@ impl App {
 
         self.update_widgets();
 
-        let audio_on = self.audio.is_some();
+        // Läuft der Mitschnitt nur für den Signal Analyzer, bleiben die Video-Effekte aus.
+        let audio_on = self.audio.is_some() && self.cfg.needs_audio();
         let levels = if audio_on { self.levels.lock().map(|l| *l).unwrap_or_default() } else { Levels::default() };
+        let scope: Option<Scope> = if self.audio.is_some() && self.slots.iter().any(|s| s.panels.iter().any(|p| p.live.is_some())) {
+            self.scope_snapshot()
+        } else {
+            None
+        };
+        let quiet = Scope::default();
         let interval = Duration::from_secs_f64(1.0 / self.cfg.general.max_fps as f64);
         let time = (now - self.start).as_secs_f32();
         let mut anything_active = false;
@@ -476,7 +490,9 @@ impl App {
             // Bei Stille nicht neu zeichnen – sonst liefe die GPU umsonst mit max_fps.
             let audible = levels.bass + levels.mid + levels.high + levels.level > 0.004;
             let effects = slot.panels.iter().any(|p| p.fx != Fx::None);
-            let animated = (audio_on && audible && slot.wallpaper.effect != Effect::None) || effects;
+            let sc = scope.as_ref().unwrap_or(&quiet);
+            let live = slot.panels.iter().any(|p| p.live.as_ref().is_some_and(|l| l.busy(sc)));
+            let animated = (audio_on && audible && slot.wallpaper.effect != Effect::None) || effects || live;
             // Großzügige Toleranz: Bilder kommen nie exakt im Takt. Mit 0,9 fiel bei 60-fps-Videos und
             // max_fps = 60 jedes leicht verfrühte Bild weg; mit 0,75 wird max_fps trotzdem eingehalten.
             if (slot.dirty || animated) && now - slot.last_render >= interval.mul_f32(0.75) {
@@ -489,8 +505,18 @@ impl App {
                 };
                 if effects {
                     let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                    for p in &slot.panels {
+                    for p in slot.panels.iter().filter(|p| p.live.is_none()) {
                         self.gpu.set_flash(&p.overlay, overlay::flash(p.fx, t));
+                    }
+                }
+                if live {
+                    for p in &mut slot.panels {
+                        if let Some(ph) = p.live.as_mut() {
+                            let screen = ph.screen;
+                            self.gpu.overlay_glow(&mut p.overlay, screen, ph.step(sc, now));
+                            // Die Leuchtspur ist reines Licht in voller Stärke.
+                            self.gpu.set_flash(&p.overlay, 1.0);
+                        }
                     }
                 }
                 self.gpu.render(&mut slot.target, tex, &params, slot.panels.iter().map(|p| &p.overlay));
@@ -554,15 +580,30 @@ impl App {
                 if existing.is_some_and(|i| slot.panels[i].content == *widgets) {
                     continue;
                 }
-                let img = self.widgets.rasterize(widgets, *pos, scale);
+                let (img, screen) = self.widgets.rasterize(widgets, *pos, scale);
                 let (x, y) = overlay::place(*pos, &img, (slot.window.width, slot.window.height), monitor.work_insets, scale);
-                let old = existing.map(|i| slot.panels.remove(i).overlay);
-                let overlay = self.gpu.overlay(old, &slot.target, (img.width, img.height), &img.rgba, &img.glow, (x, y));
+                let old = existing.map(|i| slot.panels.remove(i));
+                let (old_overlay, old_live) = old.map_or((None, None), |p| (Some(p.overlay), p.live));
+                let mut overlay = self.gpu.overlay(old_overlay, &slot.target, (img.width, img.height), &img.rgba, &img.glow, (x, y));
                 let fx = widgets.iter().map(Widget::fx).find(|f| *f != Fx::None).unwrap_or(Fx::None);
-                slot.panels.push(Panel { pos: *pos, content: widgets.clone(), overlay, fx });
+                // Nachleuchten behalten, wenn der Schirm gleich geblieben ist – sonst neu anfangen.
+                let live = screen.map(|sc| match old_live {
+                    Some(ph) if ph.fits(sc.rect, sc.mode) => ph,
+                    _ => Phosphor::new(sc.rect, sc.mode, scale),
+                });
+                if let Some(ph) = &live {
+                    // Das neue Bild hat die Leucht-Ebene geleert; die Spur sofort wieder einsetzen.
+                    self.gpu.overlay_glow(&mut overlay, ph.screen, ph.current());
+                    self.gpu.set_flash(&overlay, 1.0);
+                }
+                slot.panels.push(Panel { pos: *pos, content: widgets.clone(), overlay, fx, live });
                 slot.dirty = true;
             }
         }
+    }
+
+    fn scope_snapshot(&self) -> Option<Scope> {
+        self.widgets.scope().lock().ok().map(|s| s.clone())
     }
 
     /// Wächter: Explorer baut die Desktop-Ebene gelegentlich um (v. a. kurz nach der Anmeldung).

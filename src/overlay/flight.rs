@@ -26,13 +26,13 @@ use crate::platform::sys;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const CYAN: Color = [0x22, 0xD3, 0xEE, 255];
-const GREEN: Color = [0x34, 0xD3, 0x99, 255];
-const AMBER: Color = [0xF5, 0x9E, 0x0B, 255];
-const RED: Color = [0xF8, 0x71, 0x71, 255];
-const DIM: Color = [255, 255, 255, 140];
-const SOFT: Color = [255, 255, 255, 230];
-const HAIRLINE: Color = [255, 255, 255, 70];
+pub(super) const CYAN: Color = [0x22, 0xD3, 0xEE, 255];
+pub(super) const GREEN: Color = [0x34, 0xD3, 0x99, 255];
+pub(super) const AMBER: Color = [0xF5, 0x9E, 0x0B, 255];
+pub(super) const RED: Color = [0xF8, 0x71, 0x71, 255];
+pub(super) const DIM: Color = [255, 255, 255, 140];
+pub(super) const SOFT: Color = [255, 255, 255, 230];
+pub(super) const HAIRLINE: Color = [255, 255, 255, 70];
 
 // Maße bei Skalierung 1 (1080p).
 const W: f32 = 700.0;
@@ -214,7 +214,7 @@ impl Cache {
 }
 
 /// Text auf `max` Pixel kürzen (mit „…“).
-fn fit(fonts: &Fonts, base: &Line, s: &str, scale: f32, max: f32) -> String {
+pub(super) fn fit(fonts: &Fonts, base: &Line, s: &str, scale: f32, max: f32) -> String {
     let line = |t: &str| base.clone().span(t, WHITE);
     if text::width(fonts, &line(s), scale) <= max {
         return s.to_string();

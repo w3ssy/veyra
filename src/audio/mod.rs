@@ -6,10 +6,12 @@
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::{Arc, Mutex};
 
+pub mod scope;
 #[cfg(windows)]
 mod wasapi;
 #[cfg(windows)]
 pub use wasapi::AudioCapture;
+pub use scope::{Scope, SharedScope};
 
 /// Pegel 0.0 … ~1.0, die an den Shader gehen.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
