@@ -23,10 +23,12 @@ use crate::audio::scope::{self, Scope, BANDS, DB_CEIL, DB_FLOOR};
 use crate::config::AnalyzerMode;
 use std::time::Instant;
 
-const W: f32 = 460.0;
-const SCREEN_Y: f32 = 26.0;
-const SCREEN_H: f32 = 136.0;
-const H: f32 = 196.0;
+/// Mindestbreite des Panels (Außenmaß bei Skalierung 1).
+pub const WIDTH: f32 = 500.0;
+const SCREEN_Y: f32 = hud::HEAD_H;
+const SCREEN_H: f32 = 116.0;
+/// Innenhöhe: Kopf, Schirm, Achse, Infozeile.
+const H: f32 = SCREEN_Y + SCREEN_H + 36.0;
 /// P31-Phosphor (Oszilloskop-Grün), linear 0 … 1.
 const PHOSPHOR: [f32; 3] = [0.32, 1.0, 0.56];
 const TRACE: [u8; 4] = [0x52, 0xFF, 0x8F, 255];
@@ -66,20 +68,22 @@ fn db_y(db: f32) -> f32 {
     1.0 - (db - DB_FLOOR) / (DB_CEIL - DB_FLOOR)
 }
 
-pub fn render(a: &Analyzer, fonts: &Fonts, s: f32) -> (Image, Screen) {
-    let mut c = Canvas::new((W * s).ceil() as u32, (H * s).ceil() as u32, s);
+/// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
+pub fn render(a: &Analyzer, fonts: &Fonts, s: f32, w: f32) -> (Image, Screen) {
+    let iw = hud::inner(w);
+    let mut c = hud::panel(w, H + 2.0 * hud::PAD, s);
     let (status, color) = if a.live { ("LIVE", GREEN) } else { ("NO CARRIER", DIM) };
-    hud::header(&mut c, fonts, s, (0.0, W * s), 2.0 * s, ("SIGNAL ANALYZER", CYAN), &[(status, color)]);
+    hud::header(&mut c, fonts, s, (0.0, iw * s), 0.0, ("SIGNAL ANALYZER", CYAN), &[(status, color)]);
 
     let (sx0, sy0) = (0.0, (SCREEN_Y * s).round());
-    let (sw, sh) = ((W * s).round(), (SCREEN_H * s).round());
+    let (sw, sh) = ((iw * s).round(), (SCREEN_H * s).round());
     let (sx1, sy1) = (sx0 + sw, sy0 + sh);
     // Dunkles Glas hinter der Spur, damit sie auch über hellen Videos lesbar bleibt.
     c.rect(Layer::Back, (sx0, sy0, sx1, sy1), [2, 10, 6, 150]);
     let grid = |a: u8| [TRACE[0], TRACE[1], TRACE[2], a];
     let hline = |c: &mut Canvas, y: f32, a: u8| c.line(Layer::Back, (sx0, y), (sx1, y), 1.0, grid(a));
     let vline = |c: &mut Canvas, x: f32, a: u8| c.line(Layer::Back, (x, sy0), (x, sy1), 1.0, grid(a));
-    let axis_y = sy1 + 6.0 * s;
+    let axis_y = sy1 + 5.0 * s;
     let label_at = |c: &mut Canvas, t: &str, x: f32, y: f32| {
         let l = hud::tiny(t, DIM);
         let w = text::width(fonts, &l, s);
@@ -143,13 +147,12 @@ pub fn render(a: &Analyzer, fonts: &Fonts, s: f32) -> (Image, Screen) {
     };
     let rate = if a.rate > 0 { format!("{:.1} KHZ", a.rate as f32 / 1000.0) } else { "-- KHZ".into() };
     let peak = a.peak.map_or("PEAK -- DBFS".to_string(), |p| format!("PEAK {p} DBFS"));
-    let info = Line::new(10.0, Weight::Bold).tracking(0.14).span(format!("{mode} · {rate} · {peak}"), DIM);
-    c.text(Layer::Fore, fonts, &info, s, 0.0, (H - 13.0) * s);
+    let info = Line::new(9.0, Weight::Bold).tracking(0.14).span(format!("{mode} · {rate} · {peak}"), DIM);
+    c.text(Layer::Fore, fonts, &info, s, 0.0, (H - 11.0) * s);
 
-    let img = c.finish(s);
-    let pad = img.pad;
-    let screen = (pad + sx0 as u32, pad + sy0 as u32, sw as u32, sh as u32);
-    (img, screen)
+    let (ox, oy) = c.origin();
+    let screen = (ox + sx0 as u32, oy + sy0 as u32, sw as u32, sh as u32);
+    (c.finish(s), screen)
 }
 
 /// Die Leuchtspur eines Analyzers auf einem Monitor (eigene Größe je Skalierung).
@@ -423,7 +426,7 @@ mod tests {
     fn renders_panel() {
         let fonts = Fonts::new();
         for mode in [AnalyzerMode::Spectrum, AnalyzerMode::Wave, AnalyzerMode::Xy] {
-            let (img, screen) = render(&content(mode, &tone(440.0, 0.0)), &fonts, 1.25);
+            let (img, screen) = render(&content(mode, &tone(440.0, 0.0)), &fonts, 1.25, WIDTH);
             assert!(screen.0 + screen.2 <= img.width && screen.1 + screen.3 <= img.height);
             assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
         }

@@ -37,6 +37,9 @@ pub struct Canvas {
     pub w: u32,
     pub h: u32,
     pub pad: u32,
+    /// Ursprung der Zeichenkoordinaten im Puffer (Schattenrand plus ggf. Innenabstand eines Panels).
+    ox: f32,
+    oy: f32,
     back: Vec<Px>,
     fore: Vec<Px>,
     glow: Option<Vec<Px>>,
@@ -48,7 +51,18 @@ impl Canvas {
         let pad = shadow_radius(scale) as u32 * 3 + 2;
         let (w, h) = (w + 2 * pad, h + 2 * pad);
         let n = (w * h) as usize;
-        Self { w, h, pad, back: vec![[0.0; 4]; n], fore: vec![[0.0; 4]; n], glow: None }
+        Self { w, h, pad, ox: pad as f32, oy: pad as f32, back: vec![[0.0; 4]; n], fore: vec![[0.0; 4]; n], glow: None }
+    }
+
+    /// Zeichenkoordinaten ab jetzt relativ zu `(x, y)` (in Pixeln, bezogen auf den Inhalt ohne Schattenrand).
+    pub fn set_origin(&mut self, x: f32, y: f32) {
+        self.ox = self.pad as f32 + x.round();
+        self.oy = self.pad as f32 + y.round();
+    }
+
+    /// Wo der aktuelle Ursprung im fertigen Bild liegt (inkl. Schattenrand).
+    pub fn origin(&self) -> (u32, u32) {
+        (self.ox as u32, self.oy as u32)
     }
 
     fn buf(&mut self, l: Layer) -> &mut Vec<Px> {
@@ -76,13 +90,13 @@ impl Canvas {
 
     /// Fläche über ein Abstandsfeld füllen: `dist(x, y)` < 0 = innen; Kante 1 px weich.
     fn shape(&mut self, l: Layer, bounds: (f32, f32, f32, f32), color: Color, dist: impl Fn(f32, f32) -> f32) {
-        let (pad, w, h) = (self.pad as f32, self.w, self.h);
+        let (ox, oy, w, h) = (self.ox, self.oy, self.w, self.h);
         let c = premul(color);
         let buf = self.buf(l);
         let (x0, y0, x1, y1) = bounds;
-        for y in (y0 + pad - 1.0).floor() as i32..=(y1 + pad + 1.0).ceil() as i32 {
-            for x in (x0 + pad - 1.0).floor() as i32..=(x1 + pad + 1.0).ceil() as i32 {
-                let d = dist(x as f32 + 0.5 - pad, y as f32 + 0.5 - pad);
+        for y in (y0 + oy - 1.0).floor() as i32..=(y1 + oy + 1.0).ceil() as i32 {
+            for x in (x0 + ox - 1.0).floor() as i32..=(x1 + ox + 1.0).ceil() as i32 {
+                let d = dist(x as f32 + 0.5 - ox, y as f32 + 0.5 - oy);
                 Self::put(buf, w, h, x, y, c, (0.5 - d).clamp(0.0, 1.0));
             }
         }
@@ -150,13 +164,13 @@ impl Canvas {
 
     /// Vormultipliziertes Bild (`w` × `h`) an `(x, y)` einsetzen.
     pub fn image(&mut self, l: Layer, x: i32, y: i32, w: u32, h: u32, data: &[Px]) {
-        let (pad, cw, ch) = (self.pad as i32, self.w, self.h);
+        let (ox, oy, cw, ch) = (self.ox as i32, self.oy as i32, self.w, self.h);
         let buf = self.buf(l);
         for iy in 0..h {
             for ix in 0..w {
                 let c = data[(iy * w + ix) as usize];
                 if c[3] > 0.0 {
-                    Self::put(buf, cw, ch, x + pad + ix as i32, y + pad + iy as i32, c, 1.0);
+                    Self::put(buf, cw, ch, x + ox + ix as i32, y + oy + iy as i32, c, 1.0);
                 }
             }
         }
@@ -166,11 +180,11 @@ impl Canvas {
     pub fn text(&mut self, l: Layer, fonts: &Fonts, line: &Line, scale: f32, x: f32, y: f32) -> f32 {
         let laid = text::layout(fonts, line, scale);
         let font = fonts.get(line.weight);
-        let (pad, w, h) = (self.pad as f32, self.w, self.h);
-        let baseline = (y + pad + laid.ascent).round();
+        let (ox, w, h) = (self.ox, self.w, self.h);
+        let baseline = (y + self.oy + laid.ascent).round();
         let buf = self.buf(l);
         for g in &laid.glyphs {
-            let Some(outline) = font.outline_glyph(g.id.with_scale_and_position(laid.px, point((x + pad + g.x).round(), baseline))) else {
+            let Some(outline) = font.outline_glyph(g.id.with_scale_and_position(laid.px, point((x + ox + g.x).round(), baseline))) else {
                 continue;
             };
             let b = outline.px_bounds();

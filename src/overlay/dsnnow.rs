@@ -18,11 +18,12 @@ use super::flight::{fit, AMBER, CYAN, DIM, GREEN, HAIRLINE, RED, SOFT};
 use super::hud;
 use super::text::{self, Color, Fonts, Line, Weight};
 
-const W: f32 = 760.0;
-const ROWS_Y: f32 = 42.0;
-const ROW_H: f32 = 22.0;
-/// Spalten (x bei Skalierung 1).
-const COL: [f32; 7] = [0.0, 110.0, 206.0, 240.0, 432.0, 526.0, 618.0];
+/// Mindestbreite des Panels (Außenmaß bei Skalierung 1).
+pub const WIDTH: f32 = 640.0;
+const ROWS_Y: f32 = hud::HEAD_H + 16.0;
+const ROW_H: f32 = 19.0;
+/// Spalten (x bei Skalierung 1); die Entfernungsskala füllt den Rest der Breite.
+const COL: [f32; 7] = [0.0, 96.0, 186.0, 216.0, 352.0, 440.0, 512.0];
 /// So viele Verbindungen je Station, danach „+N MORE“.
 const PER_STATION: usize = 4;
 /// Logarithmische Entfernungsskala in km: 10⁵ … 10^10,6 (Voyager 1 liegt bei ~2,5 · 10¹⁰).
@@ -128,33 +129,38 @@ pub fn content(view: View, now: i64) -> DsnNow {
     DsnNow { status, time: format!("{:02}:{:02} UTC", t.hour, t.minute), rows }
 }
 
-pub fn render(d: &DsnNow, fonts: &Fonts, s: f32) -> Image {
-    let h = ROWS_Y + ROW_H * d.rows.len() as f32 + 2.0;
-    let mut c = Canvas::new((W * s).ceil() as u32, (h * s).ceil() as u32, s);
-    hud::header(&mut c, fonts, s, (0.0, W * s), 2.0 * s, ("DEEP SPACE NETWORK", CYAN), &[(d.status.0, d.status.1), (&d.time, DIM)]);
+/// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
+pub fn render(d: &DsnNow, fonts: &Fonts, s: f32, w: f32) -> Image {
+    let iw = hud::inner(w);
+    let h = ROWS_Y + ROW_H * d.rows.len() as f32 - 4.0;
+    let mut c = hud::panel(w, h + 2.0 * hud::PAD, s);
+    hud::header(&mut c, fonts, s, (0.0, iw * s), 0.0, ("DEEP SPACE NETWORK", CYAN), &[(d.status.0, d.status.1), (&d.time, DIM)]);
 
     let x = |i: usize| COL[i] * s;
-    let head_y = 24.0 * s;
+    let head_y = hud::HEAD_H * s;
     for (i, label) in [(0, "COMPLEX"), (1, "DISH"), (2, "LINK"), (3, "SPACECRAFT"), (4, "DATA RATE"), (5, "RTLT")] {
         c.text(Layer::Fore, fonts, &hud::tiny(label, DIM), s, x(i), head_y);
     }
     // Entfernungsskala mit Lichtlaufzeit-Marken
-    let (bar0, bar1) = (x(6), W * s - 4.0 * s);
+    let (bar0, bar1) = (x(6), iw * s - 4.0 * s);
     let marks = [(KM_PER_LIGHT_SECOND, "1LS"), (KM_PER_LIGHT_SECOND * 60.0, "1LM"), (KM_PER_LIGHT_SECOND * 3600.0, "1LH"), (KM_PER_LIGHT_SECOND * 86_400.0, "1LD")];
     for (km, label) in marks {
         let mx = bar0 + (bar1 - bar0) * range_pos(km);
         let l = hud::tiny(label, DIM);
         let lw = text::width(fonts, &l, s);
-        c.text(Layer::Fore, fonts, &l, s, (mx - lw / 2.0).min(W * s - lw), head_y);
+        c.text(Layer::Fore, fonts, &l, s, (mx - lw / 2.0).min(iw * s - lw), head_y);
     }
 
-    let value = Line::new(13.0, Weight::Bold).tracking(0.05);
+    let value = Line::new(12.0, Weight::Bold).tracking(0.05);
     let mut y = ROWS_Y * s;
     for (i, r) in d.rows.iter().enumerate() {
         if i > 0 && !r.station.is_empty() {
-            c.line(Layer::Fore, (0.0, y - 4.0 * s), (W * s, y - 4.0 * s), 1.0, HAIRLINE);
+            c.line(Layer::Fore, (0.0, y - 4.0 * s), (iw * s, y - 4.0 * s), 1.0, HAIRLINE);
         }
-        let mid = y + 8.0 * s;
+        if i == 0 {
+            c.line(Layer::Fore, (0.0, y - 5.0 * s), (iw * s, y - 5.0 * s), 1.0, HAIRLINE);
+        }
+        let mid = y + 7.0 * s;
         let put = |c: &mut Canvas, col: usize, t: &str, color: Color, max: f32| {
             let t = fit(fonts, &value, t, s, max * s);
             c.text(Layer::Fore, fonts, &value.clone().span(t, color), s, x(col), y)
@@ -168,15 +174,15 @@ pub fn render(d: &DsnNow, fonts: &Fonts, s: f32) -> Image {
         } else {
             let dw = put(&mut c, 1, &r.dish, DIM, COL[2] - COL[1]);
             if r.big {
-                c.text(Layer::Fore, fonts, &hud::tiny("70M", CYAN), s, x(1) + dw + 5.0 * s, y + 3.0 * s);
+                c.text(Layer::Fore, fonts, &hud::tiny("70M", CYAN), s, x(1) + dw + 5.0 * s, y + 2.5 * s);
             }
             // ◀ Downlink, ▶ Uplink
-            let (ax, aw) = (x(2) + 2.0 * s, 6.0 * s);
+            let (ax, aw) = (x(2) + 2.0 * s, 5.0 * s);
             if r.down {
                 c.triangle(Layer::Fore, [(ax, mid), (ax + aw * 1.4, mid - aw), (ax + aw * 1.4, mid + aw)], GREEN);
             }
             if r.up {
-                let bx = ax + 14.0 * s;
+                let bx = ax + 12.0 * s;
                 c.triangle(Layer::Fore, [(bx + aw * 1.4, mid), (bx, mid - aw), (bx, mid + aw)], AMBER);
             }
             put(&mut c, 3, &r.craft, SOFT, COL[4] - COL[3] - 8.0);
@@ -190,7 +196,7 @@ pub fn render(d: &DsnNow, fonts: &Fonts, s: f32) -> Image {
             if let Some(p) = r.range {
                 let mx = bar0 + (bar1 - bar0) * p;
                 c.line(Layer::Fore, (bar0, mid), (mx, mid), 2.0 * s, [CYAN[0], CYAN[1], CYAN[2], 150]);
-                c.disc(Layer::Fore, (mx, mid), 3.5 * s, CYAN);
+                c.disc(Layer::Fore, (mx, mid), 3.0 * s, CYAN);
             }
         }
         y += ROW_H * s;
@@ -228,9 +234,9 @@ mod tests {
         assert_eq!((d.rows[0].craft.as_str(), d.rows[1].craft.as_str()), ("VOYAGER 2", "STANDBY"));
         assert_eq!(content(View::Live(snap.clone()), snap.time + STALE + 1).status.0, "STALE");
         let fonts = Fonts::new();
-        let img = render(&d, &fonts, 1.0);
+        let img = render(&d, &fonts, 1.0, WIDTH);
         assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
-        let img = render(&content(View::Waiting, 0), &fonts, 1.0);
+        let img = render(&content(View::Waiting, 0), &fonts, 1.0, WIDTH);
         assert!(img.height > 2 * img.pad);
     }
 }

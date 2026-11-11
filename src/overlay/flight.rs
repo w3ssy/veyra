@@ -18,7 +18,7 @@
 //! 10 Sekunden bernsteinfarbene Ziffern, die im Sekundentakt aufleuchten, bei T-0 „LIFTOFF“ mit Blitz.
 //! Das Leuchten steckt in einer eigenen Ebene, die der Shader pro Bild ein- und ausblendet.
 
-use super::canvas::{box_blur, resample, Canvas, Image, Layer, Px};
+use super::canvas::{box_blur, resample, Image, Layer, Px};
 use super::launch::{Asset, View, Visual};
 use super::text::{self, Color, Fonts, Line, Weight, WHITE};
 use super::time::{MONTHS, WEEKDAYS_SHORT};
@@ -35,14 +35,16 @@ pub(super) const SOFT: Color = [255, 255, 255, 230];
 pub(super) const HAIRLINE: Color = [255, 255, 255, 70];
 
 // Maße bei Skalierung 1 (1080p).
-const W: f32 = 700.0;
-const H: f32 = 236.0;
-const SCAN_W: f32 = 170.0;
+/// Mindestbreite des Panels (Außenmaß bei Skalierung 1).
+pub const WIDTH: f32 = 620.0;
+/// Innenhöhe des Panels.
+const H: f32 = 182.0;
+const SCAN_W: f32 = 140.0;
 /// Bildfläche im Rahmen: links Platz fürs Höhenband, oben fürs Label.
-const SCAN_INSET: (f32, f32, f32, f32) = (18.0, 22.0, 6.0, 8.0);
-const RING: f32 = 88.0;
-const COL_X: f32 = SCAN_W + 14.0;
-const LABEL_W: f32 = 84.0;
+const SCAN_INSET: (f32, f32, f32, f32) = (16.0, 20.0, 6.0, 6.0);
+const RING: f32 = 80.0;
+const COL_X: f32 = SCAN_W + 16.0;
+const LABEL_W: f32 = 76.0;
 
 /// Animierter Effekt, den der Shader pro Bild berechnet.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,9 +232,11 @@ pub(super) fn fit(fonts: &Fonts, base: &Line, s: &str, scale: f32, max: f32) -> 
     String::new()
 }
 
-pub fn render(f: &Flight, fonts: &Fonts, scale: f32, cache: &mut Cache) -> Image {
+/// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
+pub fn render(f: &Flight, fonts: &Fonts, scale: f32, cache: &mut Cache, w: f32) -> Image {
     let s = scale;
-    let mut c = Canvas::new((W * s).ceil() as u32, (H * s).ceil() as u32, s);
+    let iw = super::hud::inner(w);
+    let mut c = super::hud::panel(w, H + 2.0 * super::hud::PAD, s);
     let hud = |a: u8| [CYAN[0], CYAN[1], CYAN[2], a];
 
     // ── Raketen-Scan (Hintergrund-Ebene), genau im Inneren des Rahmens ──
@@ -264,71 +268,53 @@ pub fn render(f: &Flight, fonts: &Fonts, scale: f32, cache: &mut Cache) -> Image
         }
     }
 
-    // ── HUD-Rahmen um den Scan ──
-    let (x0, y0, x1, y1) = (0.5, 0.5, SCAN_W * s, H * s - 0.5);
-    let arm = 14.0 * s;
-    let lw = (1.6 * s).max(1.0);
-    for (ax, ay, dx, dy) in [(x0, y0, 1.0, 1.0), (x1, y0, -1.0, 1.0), (x0, y1, 1.0, -1.0), (x1, y1, -1.0, -1.0)] {
-        c.line(Layer::Fore, (ax, ay), (ax + dx * arm, ay), lw, hud(210));
-        c.line(Layer::Fore, (ax, ay), (ax, ay + dy * arm), lw, hud(210));
-    }
+    // ── Trennlinie zwischen Scan und Daten (die Ecken liefert das Panel) ──
+    let sep = (SCAN_W + 7.0) * s;
+    c.line(Layer::Fore, (sep, 0.0), (sep, H * s), 1.0, HAIRLINE);
     // Höhenband
     let mut i = 0;
-    let mut ty = 24.0 * s;
-    while ty < (H - 20.0) * s {
+    let mut ty = 22.0 * s;
+    while ty < (H - 16.0) * s {
         let len = if i % 5 == 0 { 8.0 } else { 4.0 } * s;
         c.line(Layer::Fore, (4.0 * s, ty), (4.0 * s + len, ty), 1.0, hud(120));
         ty += 8.0 * s;
         i += 1;
     }
     if f.photo.is_some() {
-        let label = Line::new(9.0, Weight::Bold).tracking(0.12).span(f.scan_label, hud(190));
-        c.text(Layer::Fore, fonts, &label, s, 18.0 * s, 6.0 * s);
+        let label = Line::new(8.5, Weight::Bold).tracking(0.12).span(f.scan_label, hud(190));
+        c.text(Layer::Fore, fonts, &label, s, 16.0 * s, 5.0 * s);
     }
 
     // ── Kopfzeile: Titel, Haarlinie, Status ──
     let x = COL_X * s;
     // Den Ring gibt es nur, wenn er etwas Echtes zeigt (Patch oder Ziel-Orbit); sonst nutzt der Text die Breite.
     let ring = f.patch.is_some() || !f.orbit.is_empty();
-    let ring_x = (W - RING) * s;
-    let edge = if ring { ring_x - 16.0 * s } else { W * s };
-    let head = Line::new(14.0, Weight::Bold).tracking(0.12).span(&f.header.0, f.header.1);
-    let head_w = c.text(Layer::Fore, fonts, &head, s, x, 2.0 * s);
-    let mut right = edge;
-    let mid_y = 11.0 * s;
-    let pill = |c: &mut Canvas, label: &str, color: Color, right: &mut f32| {
-        let t = Line::new(14.0, Weight::Bold).tracking(0.08).span(label, color);
-        let tw = text::width(fonts, &t, s);
-        let tx = *right - tw;
-        c.text(Layer::Fore, fonts, &t, s, tx, 2.0 * s);
-        c.disc(Layer::Fore, (tx - 9.0 * s, mid_y), 4.5 * s, color);
-        *right = tx - 24.0 * s;
-    };
+    let ring_x = (iw - RING) * s;
+    let edge = if ring { ring_x - 16.0 * s } else { iw * s };
+    let mut pills: Vec<(&str, Color)> = Vec::new();
     if let Some((st, col)) = &f.status {
-        pill(&mut c, st, *col, &mut right);
+        pills.push((st, *col));
     }
     if f.live {
-        pill(&mut c, "LIVE", RED, &mut right);
+        pills.push(("LIVE", RED));
     }
-    if right > x + head_w + 24.0 * s {
-        c.line(Layer::Fore, (x + head_w + 12.0 * s, mid_y), (right, mid_y), 1.0, HAIRLINE);
-    }
+    super::hud::header(&mut c, fonts, s, (x, edge), 0.0, (&f.header.0, f.header.1), &pills);
 
     // ── Countdown (passt sich der Breite an, z. B. mit Tagen) ──
     let avail = edge - x;
-    let mut size = 54.0;
+    let mut size = 46.0;
     let count_line = |size: f32, color: Color| Line::new(size, Weight::Bold).tabular().tracking(0.02).span(&f.count, color);
-    while size > 30.0 && text::width(fonts, &count_line(size, WHITE), s) > avail {
+    while size > 28.0 && text::width(fonts, &count_line(size, WHITE), s) > avail {
         size -= 2.0;
     }
-    let cy = 22.0 * s + (54.0 - size) * 0.6 * s;
+    let cy = 18.0 * s + (46.0 - size) * 0.6 * s;
     c.text(Layer::Fore, fonts, &count_line(size, f.count_color), s, x - 2.0 * s, cy);
     if let Some(g) = f.glow {
         c.text(Layer::Glow, fonts, &count_line(size, g), s, x - 2.0 * s, cy);
     }
 
     // ── Schiene: die letzten 24 Stunden ──
-    let ry = 96.0 * s;
+    let ry = 80.0 * s;
     let rw = edge - 8.0 * s - x;
     c.line(Layer::Fore, (x, ry), (x + rw, ry), 1.0, [255, 255, 255, 60]);
     let fx = x + rw * f.rail;
@@ -341,26 +327,22 @@ pub fn render(f: &Flight, fonts: &Fonts, scale: f32, cache: &mut Cache) -> Image
         c.line(Layer::Fore, (tx, ry - len), (tx, ry), 1.0, [255, 255, 255, 110]);
     }
     c.triangle(Layer::Fore, [(fx - 5.0 * s, ry + 9.0 * s), (fx + 5.0 * s, ry + 9.0 * s), (fx, ry + 3.0 * s)], f.header.1);
-    let tiny = |t: &str| Line::new(9.0, Weight::Bold).tracking(0.1).span(t, DIM);
+    let tiny = |t: &str| super::hud::tiny(t, DIM);
     c.text(Layer::Fore, fonts, &tiny("T-24H"), s, x, ry + 8.0 * s);
     let t0 = tiny("T-0");
     c.text(Layer::Fore, fonts, &t0, s, x + rw - text::width(fonts, &t0, s), ry + 8.0 * s);
 
     // ── Datenzeilen ──
-    let value_base = Line::new(15.0, Weight::Bold).tracking(0.05);
-    let value_max = W * s - (x + LABEL_W * s);
-    let mut y = 126.0 * s;
+    let mut y = 102.0 * s;
     for (label, value) in &f.rows {
-        c.text(Layer::Fore, fonts, &Line::new(10.0, Weight::Bold).tracking(0.14).span(*label, DIM), s, x, y + 3.0 * s);
-        let v = fit(fonts, &value_base, value, s, value_max);
-        c.text(Layer::Fore, fonts, &value_base.clone().span(v, SOFT), s, x + LABEL_W * s, y);
-        y += 26.0 * s;
+        super::hud::row(&mut c, fonts, s, x, y, LABEL_W, iw * s, label, value, SOFT);
+        y += super::hud::ROW_H * s;
     }
 
     // ── Instrumenten-Ring: Mission-Patch oder Ziel-Orbit (aus den Startdaten) ──
     if ring {
         let r = RING / 2.0 * s;
-        let center = (ring_x + r, 4.0 * s + r);
+        let center = (ring_x + r, r);
         c.ring(Layer::Fore, center, r, 1.0, hud(170));
         for i in 0..72 {
             let a = (i as f32 * 5.0).to_radians();
@@ -376,10 +358,10 @@ pub fn render(f: &Flight, fonts: &Fonts, scale: f32, cache: &mut Cache) -> Image
             None => {
                 let label = tiny("ORBIT");
                 let lw = text::width(fonts, &label, s);
-                c.text(Layer::Fore, fonts, &label, s, center.0 - lw / 2.0, center.1 - 20.0 * s);
-                let orbit = Line::new(17.0, Weight::Bold).tracking(0.06).span(&f.orbit, SOFT);
+                c.text(Layer::Fore, fonts, &label, s, center.0 - lw / 2.0, center.1 - 18.0 * s);
+                let orbit = Line::new(15.0, Weight::Bold).tracking(0.06).span(&f.orbit, SOFT);
                 let ow = text::width(fonts, &orbit, s);
-                c.text(Layer::Fore, fonts, &orbit, s, center.0 - ow / 2.0, center.1 - 7.0 * s);
+                c.text(Layer::Fore, fonts, &orbit, s, center.0 - ow / 2.0, center.1 - 6.0 * s);
             }
         }
     }
@@ -530,12 +512,12 @@ mod tests {
         let fonts = Fonts::new();
         let mut cache = Cache::default();
         let now = 1_000_000;
-        let img = render(&content(launch(now + 5, "Go", true), now), &fonts, 1.0, &mut cache);
+        let img = render(&content(launch(now + 5, "Go", true), now), &fonts, 1.0, &mut cache, WIDTH);
         assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
         assert_eq!(img.glow.len(), img.rgba.len(), "Countdown-Leuchten vorhanden");
-        let img = render(&content(View::Waiting, now), &fonts, 1.5, &mut cache);
+        let img = render(&content(View::Waiting, now), &fonts, 1.5, &mut cache, WIDTH);
         assert!(img.glow.is_empty());
-        assert!(img.width as f32 >= W * 1.5);
+        assert!(img.width as f32 >= WIDTH * 1.5);
     }
 }
 

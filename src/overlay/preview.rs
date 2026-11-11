@@ -3,7 +3,9 @@
 
 use super::canvas::Image;
 use super::text::Fonts;
-use super::{analyzer, dsn, dsnnow, spaceclock};
+use super::launch::{Launch, LaunchView, View};
+use super::{analyzer, dsn, dsnnow, flight, place, spaceclock, Widget};
+use crate::config::Position;
 use crate::audio::scope::{Scope, BANDS};
 use crate::config::{AnalyzerMode, DeepSpaceClockWidget};
 use std::path::Path;
@@ -127,11 +129,11 @@ fn preview() {
     let now = super::time::now_unix();
 
     let cfg = DeepSpaceClockWidget { longitude: Some(13.40), ..Default::default() };
-    let img = spaceclock::render(&spaceclock::content(&cfg, now), &fonts, 1.0);
+    let img = spaceclock::render(&spaceclock::content(&cfg, now), &fonts, 1.0, spaceclock::WIDTH);
     write_png(&dir.join("deep_space_clock.png"), img.width, img.height, &compose(&img, None));
 
     for mode in [AnalyzerMode::Spectrum, AnalyzerMode::Wave, AnalyzerMode::Xy] {
-        let (img, screen) = analyzer::render(&analyzer::content(mode, &music(0)), &fonts, 1.0);
+        let (img, screen) = analyzer::render(&analyzer::content(mode, &music(0)), &fonts, 1.0, analyzer::WIDTH);
         let mut ph = analyzer::Phosphor::new(screen, mode, 1.0);
         let mut t = Instant::now();
         for f in 0..14 {
@@ -154,7 +156,104 @@ fn preview() {
 <dish name="DSS35" activity="Engineering Upgrades"><target name="DSN" rtlt="-1"/></dish>
 <timestamp>1794450905000</timestamp></dsn>"#;
     let snap = std::sync::Arc::new(dsn::parse(xml).unwrap());
-    let img = dsnnow::render(&dsnnow::content(dsn::View::Live(snap.clone()), snap.time + 20), &fonts, 1.0);
+    let dsn_now = dsnnow::content(dsn::View::Live(snap.clone()), snap.time + 20);
+    let img = dsnnow::render(&dsn_now, &fonts, 1.0, dsnnow::WIDTH);
     write_png(&dir.join("dsn_now.png"), img.width, img.height, &compose(&img, None));
+
+    let mut cache = flight::Cache::default();
+    let fl = flight::content(rocket(now + 21_447), now);
+    let img = flight::render(&fl, &fonts, 1.0, &mut cache, flight::WIDTH);
+    write_png(&dir.join("flight_control.png"), img.width, img.height, &compose(&img, None));
+
+    // Gesamtansicht 1920 × 1080 mit Taskleiste: wie im Alltag verteilt, und einmal gestapelt.
+    let dsc = Widget::SpaceClock(Box::new(spaceclock::content(&cfg, now)));
+    let ana = Widget::Analyzer(analyzer::content(AnalyzerMode::Spectrum, &music(0)));
+    let layouts: [(&str, super::Content); 2] = [
+        (
+            "dashboard.png",
+            vec![
+                (Position::TopLeft, vec![Widget::Dsn(Box::new(dsn_now.clone()))]),
+                (Position::TopRight, vec![dsc.clone()]),
+                (Position::BottomLeft, vec![Widget::Flight(Box::new(fl.clone()))]),
+                (Position::BottomRight, vec![ana.clone()]),
+            ],
+        ),
+        (
+            "dashboard_stacked.png",
+            vec![
+                (Position::TopLeft, vec![Widget::Dsn(Box::new(dsn_now)), Widget::Flight(Box::new(fl))]),
+                (Position::TopRight, vec![dsc, ana]),
+            ],
+        ),
+    ];
+    for (name, layout) in layouts {
+        let mut widgets = super::Widgets::new();
+        let (sw, sh) = (1920u32, 1080u32);
+        let mut out: Vec<f32> = (0..sw * sh)
+            .flat_map(|i| {
+                let (x, y) = ((i % sw) as f32 / sw as f32, (i / sw) as f32 / sh as f32);
+                // Heller Nebel in der Mitte oben, sonst dunkler Weltraum – prüft die Lesbarkeit.
+                let d = ((x - 0.62).powi(2) + (y - 0.25).powi(2) * 2.0).sqrt();
+                let neb = (1.0 - d * 2.4).max(0.0).powf(1.5);
+                [20.0 + 215.0 * neb, 24.0 + 190.0 * neb, 34.0 + 150.0 * neb]
+            })
+            .collect();
+        for (pos, list) in layout {
+            let (img, live) = widgets.rasterize(&list, pos, 1.0);
+            let (px, py) = place(pos, &img, (sw, sh), [0, 0, 0, 48], 1.0);
+            let glow = live.map(|l| {
+                let mut ph = analyzer::Phosphor::new(l.rect, l.mode, 1.0);
+                let mut t = Instant::now();
+                for f in 0..14 {
+                    t += Duration::from_millis(16);
+                    ph.step(&music(f), t);
+                }
+                (l.rect, ph.current().to_vec())
+            });
+            for y in 0..img.height {
+                for x in 0..img.width {
+                    let (ox, oy) = (px + x as i32, py + y as i32);
+                    if ox < 0 || oy < 0 || ox >= sw as i32 || oy >= sh as i32 {
+                        continue;
+                    }
+                    let i = ((y * img.width + x) * 4) as usize;
+                    let o = (oy as u32 * sw + ox as u32) as usize * 3;
+                    let a = img.rgba[i + 3] as f32 / 255.0;
+                    for k in 0..3 {
+                        let mut g = if img.glow.is_empty() { 0.0 } else { img.glow[i + k] as f32 };
+                        if let Some(((gx, gy, gw, gh), data)) = &glow {
+                            if x >= *gx && y >= *gy && x < gx + gw && y < gy + gh {
+                                g = data[(((y - gy) * gw + x - gx) * 4) as usize + k] as f32;
+                            }
+                        }
+                        out[o + k] = img.rgba[i + k] as f32 + out[o + k] * (1.0 - a) + g;
+                    }
+                }
+            }
+        }
+        let rgb: Vec<u8> = out.iter().map(|v| v.min(255.0) as u8).collect();
+        write_png(&dir.join(name), sw, sh, &rgb);
+    }
     println!("Vorschau in {}", dir.display());
+}
+
+fn rocket(net: i64) -> View {
+    View::Launch(Box::new(LaunchView {
+        launch: Launch {
+            id: "x".into(),
+            rocket: "Falcon 9".into(),
+            mission: "USSF-627".into(),
+            orbit: "LEO".into(),
+            net,
+            precise: true,
+            exact: true,
+            status: "Go".into(),
+            pad: "SLC-4E".into(),
+            location: "Vandenberg SFB".into(),
+            webcast: false,
+            image: String::new(),
+        },
+        photo: None,
+        patch: None,
+    }))
 }

@@ -32,9 +32,9 @@ use time::{DateTime, MONTHS, WEEKDAYS};
 const SOFT: Color = [255, 255, 255, 225];
 
 /// Abstand zum Rand des Arbeitsbereichs bei Skalierung 1.
-const MARGIN: f32 = 48.0;
-/// Abstand zwischen zwei Widgets an derselben Position.
-const STACK_GAP: f32 = 28.0;
+const MARGIN: f32 = 28.0;
+/// Abstand zwischen zwei Widgets an derselben Position – Panels rücken wie Kacheln zusammen.
+const STACK_GAP: f32 = 10.0;
 
 /// Ein Widget mit allem, was es gerade zeigt.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +47,17 @@ pub enum Widget {
 }
 
 impl Widget {
+    /// Mindestbreite des Panels (Außenmaß bei Skalierung 1); die Uhr ist freier Text ohne Panel.
+    fn panel_width(&self) -> Option<f32> {
+        match self {
+            Widget::Clock(_) => None,
+            Widget::Flight(_) => Some(flight::WIDTH),
+            Widget::SpaceClock(_) => Some(spaceclock::WIDTH),
+            Widget::Analyzer(_) => Some(analyzer::WIDTH),
+            Widget::Dsn(_) => Some(dsnnow::WIDTH),
+        }
+    }
+
     pub fn fx(&self) -> Fx {
         match self {
             Widget::Flight(f) => f.fx,
@@ -149,17 +160,19 @@ impl Widgets {
             1 => Align::Center,
             _ => Align::Right,
         };
+        // Gestapelte Panels bekommen alle die Breite des breitesten – sie bilden eine bündige Spalte.
+        let width = widgets.iter().filter_map(Widget::panel_width).fold(0.0, f32::max);
         let mut live = None;
         let images: Vec<Image> = widgets
             .iter()
             .enumerate()
             .map(|(i, w)| match w {
                 Widget::Clock(lines) => text::render(&self.fonts, lines, align, scale),
-                Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache),
-                Widget::SpaceClock(c) => spaceclock::render(c, &self.fonts, scale),
-                Widget::Dsn(d) => dsnnow::render(d, &self.fonts, scale),
+                Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache, width),
+                Widget::SpaceClock(c) => spaceclock::render(c, &self.fonts, scale, width),
+                Widget::Dsn(d) => dsnnow::render(d, &self.fonts, scale, width),
                 Widget::Analyzer(a) => {
-                    let (img, rect) = analyzer::render(a, &self.fonts, scale);
+                    let (img, rect) = analyzer::render(a, &self.fonts, scale, width);
                     live = Some((i, LiveScreen { rect, mode: a.mode() }));
                     img
                 }
@@ -266,8 +279,8 @@ mod tests {
         let img = Image { width: 300, height: 120, pad: 14, rgba: Vec::new(), glow: Vec::new() };
         // Taskleiste unten, 48 px hoch
         let (x, y) = place(Position::BottomLeft, &img, (1920, 1080), [0, 0, 0, 48], 1.0);
-        assert_eq!(x, 48 - 14);
-        assert_eq!(y + 120 - 14, 1080 - 48 - 48, "Unterkante des Inhalts 48 px über der Taskleiste");
+        assert_eq!(x, MARGIN as i32 - 14);
+        assert_eq!(y + 120 - 14, 1080 - 48 - MARGIN as i32, "Unterkante des Inhalts MARGIN über der Taskleiste");
         let (x, _) = place(Position::Center, &img, (1920, 1080), [0, 0, 0, 48], 1.0);
         assert_eq!(x, (1920 - 300) / 2);
     }

@@ -23,11 +23,11 @@ use crate::config::DeepSpaceClockWidget;
 
 pub const MARS: Color = [0xFB, 0x8C, 0x3C, 255];
 
-const W: f32 = 600.0;
-const ROWS_Y: f32 = 106.0;
-const ROW_H: f32 = 23.0;
-const RING: f32 = 104.0;
-const LABEL_W: f32 = 128.0;
+/// Mindestbreite des Panels (Außenmaß bei Skalierung 1).
+pub const WIDTH: f32 = 500.0;
+const ROWS_Y: f32 = 86.0;
+const RING: f32 = 90.0;
+const LABEL_W: f32 = 116.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpaceClock {
@@ -74,33 +74,36 @@ pub fn content(cfg: &DeepSpaceClockWidget, now: i64) -> SpaceClock {
     }
 }
 
-pub fn render(f: &SpaceClock, fonts: &Fonts, s: f32) -> Image {
-    let h = ROWS_Y + ROW_H * f.rows.len() as f32 + 1.0;
-    let mut c = Canvas::new((W * s).ceil() as u32, (h * s).ceil() as u32, s);
-    let ring_x = (W - RING) * s;
-    let edge = ring_x - 18.0 * s;
-    hud::header(&mut c, fonts, s, (0.0, edge), 2.0 * s, ("DEEP SPACE CLOCK", CYAN), &[("UTC", CYAN)]);
+/// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
+pub fn render(f: &SpaceClock, fonts: &Fonts, s: f32, w: f32) -> Image {
+    let iw = hud::inner(w);
+    // Unten mindestens bis unter die Legende des Zifferblatts.
+    let h = (ROWS_Y + hud::ROW_H * f.rows.len() as f32 - 4.0).max(RING + 18.0);
+    let mut c = hud::panel(w, h + 2.0 * hud::PAD, s);
+    let ring_x = (iw - RING) * s;
+    let edge = ring_x - 16.0 * s;
+    hud::header(&mut c, fonts, s, (0.0, edge), 0.0, ("DEEP SPACE CLOCK", CYAN), &[("UTC", CYAN)]);
 
-    let big = Line::new(54.0, Weight::Bold).tabular().tracking(0.02).span(&f.utc, WHITE);
-    c.text(Layer::Fore, fonts, &big, s, -2.0 * s, 22.0 * s);
-    let date = Line::new(11.0, Weight::Bold).tracking(0.12).span(&f.date, DIM);
-    c.text(Layer::Fore, fonts, &date, s, 0.0, 84.0 * s);
+    let big = Line::new(42.0, Weight::Bold).tabular().tracking(0.02).span(&f.utc, WHITE);
+    c.text(Layer::Fore, fonts, &big, s, -2.0 * s, 18.0 * s);
+    let date = Line::new(9.5, Weight::Bold).tracking(0.12).span(&f.date, DIM);
+    c.text(Layer::Fore, fonts, &date, s, 0.0, 66.0 * s);
 
     let mut y = ROWS_Y * s;
     for (label, value, color) in &f.rows {
         hud::row(&mut c, fonts, s, 0.0, y, LABEL_W, edge, label, value, *color);
-        y += ROW_H * s;
+        y += hud::ROW_H * s;
     }
 
     // ── Zifferblatt: 24 Stunden, Mitternacht oben; Erde außen, Mars innen ──
     let r = RING / 2.0 * s;
-    let center = (ring_x + r, 4.0 * s + r);
+    let center = (ring_x + r, r);
     let hud_c = |a: u8| [CYAN[0], CYAN[1], CYAN[2], a];
     c.ring(Layer::Fore, center, r, 1.0, hud_c(170));
     for i in 0..96 {
         let a = (i as f32 / 96.0 * 360.0).to_radians();
         let major = i % 4 == 0;
-        let inner = r - if i % 24 == 0 { 8.0 } else if major { 5.0 } else { 2.5 } * s;
+        let inner = r - if i % 24 == 0 { 7.0 } else if major { 4.5 } else { 2.5 } * s;
         let p = |rad: f32| (center.0 + a.sin() * rad, center.1 - a.cos() * rad);
         c.line(Layer::Fore, p(inner), p(r), 1.0, hud_c(if major { 170 } else { 90 }));
     }
@@ -114,18 +117,18 @@ pub fn render(f: &SpaceClock, fonts: &Fonts, s: f32) -> Image {
         c.ring(Layer::Fore, center, r * 0.62, 1.0, [MARS[0], MARS[1], MARS[2], 110]);
         hand(&mut c, f.mars, r * 0.62, 1.8 * s, MARS);
     }
-    hand(&mut c, f.earth, r - 11.0 * s, 1.8 * s, CYAN);
+    hand(&mut c, f.earth, r - 10.0 * s, 1.8 * s, CYAN);
     c.disc(Layer::Fore, center, 3.0 * s, WHITE);
     for (i, label) in ["00", "06", "12", "18"].into_iter().enumerate() {
         let a = (i as f32 * 90.0).to_radians();
         let l = hud::tiny(label, DIM);
         let lw = super::text::width(fonts, &l, s);
-        let rad = r - 17.0 * s;
-        c.text(Layer::Fore, fonts, &l, s, center.0 + a.sin() * rad - lw / 2.0, center.1 - a.cos() * rad - 6.0 * s);
+        let rad = r - 15.0 * s;
+        c.text(Layer::Fore, fonts, &l, s, center.0 + a.sin() * rad - lw / 2.0, center.1 - a.cos() * rad - 5.5 * s);
     }
     // Legende unter dem Zifferblatt
     let mut lx = ring_x + 4.0 * s;
-    let ly = 4.0 * s + RING * s + 8.0 * s;
+    let ly = RING * s + 7.0 * s;
     let legend: &[(&str, Color)] = if f.mars >= 0.0 { &[("ERDE", CYAN), ("MARS", MARS)] } else { &[("ERDE", CYAN)] };
     for (label, color) in legend {
         c.disc(Layer::Fore, (lx + 3.0 * s, ly + 5.0 * s), 3.0 * s, *color);
@@ -159,7 +162,7 @@ mod tests {
     #[test]
     fn renders() {
         let fonts = Fonts::new();
-        let img = render(&content(&DeepSpaceClockWidget::default(), 1_794_450_900), &fonts, 1.0);
+        let img = render(&content(&DeepSpaceClockWidget::default(), 1_794_450_900), &fonts, 1.0, WIDTH);
         assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
         assert!(img.glow.is_empty());
     }
