@@ -14,7 +14,9 @@ pub mod dsn;
 pub mod dsnnow;
 pub mod flight;
 pub mod hud;
+pub mod iss;
 pub mod launch;
+pub mod orbit;
 #[cfg(test)]
 mod preview;
 pub mod spaceclock;
@@ -42,6 +44,7 @@ pub enum Widget {
     SpaceClock(Box<spaceclock::SpaceClock>),
     Analyzer(analyzer::Analyzer),
     Dsn(Box<dsnnow::DsnNow>),
+    Iss(Box<iss::Iss>),
 }
 
 impl Widget {
@@ -53,6 +56,7 @@ impl Widget {
             Widget::SpaceClock(_) => Some(spaceclock::WIDTH),
             Widget::Analyzer(_) => Some(analyzer::WIDTH),
             Widget::Dsn(_) => Some(dsnnow::WIDTH),
+            Widget::Iss(_) => Some(iss::WIDTH),
         }
     }
 
@@ -80,6 +84,7 @@ pub struct Widgets {
     fonts: Fonts,
     feed: Option<Feed>,
     dsn: Option<dsn::Feed>,
+    iss: Option<iss::Feed>,
     cache: flight::Cache,
     /// Messdaten aus dem Audio-Thread (für den Signal Analyzer).
     scope: SharedScope,
@@ -87,7 +92,7 @@ pub struct Widgets {
 
 impl Widgets {
     pub fn new() -> Self {
-        Self { fonts: Fonts::new(), feed: None, dsn: None, cache: flight::Cache::default(), scope: Default::default() }
+        Self { fonts: Fonts::new(), feed: None, dsn: None, iss: None, cache: flight::Cache::default(), scope: Default::default() }
     }
 
     /// Wohin der Audio-Thread die Messdaten schreibt.
@@ -119,6 +124,17 @@ impl Widgets {
             }
             _ => {}
         }
+        match (cfg.iss.enabled, self.iss.is_some()) {
+            (true, false) => {
+                log::info!("ISS Tracker aktiv – Bahndaten von celestrak.org");
+                self.iss = Some(iss::Feed::start(config::config_dir()));
+            }
+            (false, true) => {
+                log::info!("ISS Tracker aus – kein Netzwerkzugriff mehr für Bahndaten");
+                self.iss = None;
+            }
+            _ => {}
+        }
     }
 
     /// Was jetzt angezeigt werden soll, gruppiert nach Position.
@@ -147,6 +163,10 @@ impl Widgets {
             let view = self.dsn.as_ref().map_or(dsn::View::Waiting, |f| f.view());
             add(cfg.dsn.position, Widget::Dsn(Box::new(dsnnow::content(view, now))));
         }
+        if cfg.iss.enabled {
+            let view = self.iss.as_ref().map_or(iss::View::Waiting, |f| f.view());
+            add(cfg.iss.position, Widget::Iss(Box::new(iss::content(view, now))));
+        }
         out
     }
 
@@ -169,6 +189,7 @@ impl Widgets {
                 Widget::Flight(f) => flight::render(f, &self.fonts, scale, &mut self.cache, width),
                 Widget::SpaceClock(c) => spaceclock::render(c, &self.fonts, scale, width),
                 Widget::Dsn(d) => dsnnow::render(d, &self.fonts, scale, width),
+                Widget::Iss(d) => iss::render(d, &self.fonts, scale, width),
                 Widget::Analyzer(a) => {
                     let (img, rect) = analyzer::render(a, &self.fonts, scale, width);
                     live = Some((i, LiveScreen { rect, mode: a.mode() }));

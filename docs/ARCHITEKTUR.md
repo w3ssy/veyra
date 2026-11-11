@@ -12,8 +12,8 @@
 |---|---|
 | Eingebetteter Chromium (CEF) für Web-Wallpaper: ~100–300 MB RAM pro Instanz, großer Angriffsvektor | Kein Browser. Nur Videodateien. |
 | JavaScript/„SceneScript“ aus dem Workshop führt fremden Code aus | Kein Skripting, keine Plugins, keine Workshop-Downloads |
-| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahmen: Flight Control und DSN Now (feste HTTPS-Adressen, nur lesend) |
-| Große Codebasis, viele Drittbibliotheken | ~9.300 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
+| Netzwerkzugriff (Steam, Workshop, Web-Wallpaper) | Kein Netzwerk – einzige, abschaltbare Ausnahmen: Flight Control, DSN Now und ISS Tracker (feste HTTPS-Adressen, nur lesend) |
+| Große Codebasis, viele Drittbibliotheken | ~10.500 Zeilen Rust (inkl. Kommentare/Tests), 11 direkte Abhängigkeiten |
 | Rendert oft dauerhaft mit voller Bildrate | Zeichnet nur, wenn ein neues Videobild fällig ist |
 
 ## Aufbau
@@ -69,6 +69,8 @@ welcher Monitor welches Video zeigt. Darstellung, Effekte, Pausen-Regeln oder Au
 | `overlay/analyzer.rs` | Signal Analyzer: Rahmen/Raster (1×/s) und Phosphor-Schirm (pro Bild, mit Nachleuchten) | nein |
 | `overlay/dsn.rs` | DSN Now: Antennenstatus abfragen, eigener Mini-XML-Leser, Kürzel → Sondennamen | nein (HTTPS über `platform::sys`) |
 | `overlay/dsnnow.rs` | DSN Now: Tafel mit Link-Richtung, Datenrate, Laufzeit, logarithmischer Entfernungsskala | nein |
+| `overlay/orbit.rs` | Bahnrechnung aus TLE (Kepler + J2 + Abbremsung), Sonnenstand, Erdschatten | nein |
+| `overlay/iss.rs` | ISS Tracker: Bahndaten abrufen/zwischenspeichern, mitscrollende Minimap mit eingebetteter Landmaske | nein (HTTPS über `platform::sys`) |
 
 **Widgets** kosten fast nichts: Der Inhalt wird höchstens einmal pro Sekunde bestimmt und nur bei einer Änderung
 neu gerastert (Uhr ohne Sekunden: einmal pro Minute). Das fertige Bild liegt als kleine Textur auf der GPU und wird
@@ -142,7 +144,7 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
   Veyra selbst enthält keinen Medienparser.
 - **Kein Netzwerk**: weder Updates noch Telemetrie noch Downloads. `MFSTARTUP_NOSOCKET` verhindert zusätzlich,
   dass Media Foundation Netzwerkquellen öffnet.
-  **Einzige Ausnahmen: Flight Control und DSN Now** (beide standardmäßig aus). Nur solange Flight Control aktiv ist, läuft ein Thread, der
+  **Einzige Ausnahmen: Flight Control, DSN Now und ISS Tracker** (alle standardmäßig aus). Nur solange Flight Control aktiv ist, läuft ein Thread, der
   alle 15 Minuten (in der Stunde vor einem Start alle 6 Minuten) die Liste der nächsten Starts von
   `https://ll.thespacedevs.com/2.3.0/…` abfragt, einmal pro neuem Start dessen Mission-Patch, und Fotos/Patches der
   nächsten zwei Starts aus der Bildablage `https://thespacedevs-prod.nyc3.digitaloceanspaces.com/media/…` lädt.
@@ -156,7 +158,11 @@ bevor es sich einbettet – direkt nach der Anmeldung baut Explorer die Ebenen s
   **DSN Now** fragt, solange es aktiv ist, einmal pro Minute `https://eyes.nasa.gov/dsn/data/dsn.xml` ab (Antwort auf
   1 MB begrenzt). Gelesen werden nur Elemente und Attribute mit einem eigenen, minimalen Leser – keine DTDs, keine
   Entitäten, keine externen Verweise; die Werte landen ausschließlich in Text- und Zahlenfeldern.
-  Prüfbar: `grep -rn "https_get" src/` – aufgerufen wird es nur in `overlay/launch.rs` und `overlay/dsn.rs`.
+  Der **ISS Tracker** fragt alle 6 Stunden `https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE` ab
+  (Antwort auf 4 KB begrenzt, zwischengespeichert in `%APPDATA%\Veyra\iss.tle`; nach einem Neustart wird erst
+  wieder geladen, wenn die Datei älter als 6 Stunden ist). Angenommen werden nur zwei Zeilen im festen TLE-Format
+  mit gültiger Prüfsumme; daraus werden ausschließlich Zahlen gelesen.
+  Prüfbar: `grep -rn "https_get" src/` – aufgerufen wird es nur in `overlay/launch.rs`, `overlay/dsn.rs` und `overlay/iss.rs`.
 - **Keine Adminrechte**, schreibt nur nach `%APPDATA%\Veyra`, `HKCU\…\Run` (Autostart) und – nur wenn in den
   Einstellungen aktiviert – eine Verknüpfung ins eigene Startmenü (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`).
 - **Speichersicher**: Rust; `unsafe` nur an den Grenzen zu Win32/COM, jeweils gekapselt.
@@ -195,6 +201,6 @@ Neu zu schreiben – mit derselben Schnittstelle wie `platform/windows.rs`:
    Wächter für die Desktop-Einbettung, Release-Builds per GitHub Actions.)* *(Erledigt: eigenes Programm- und Tray-Symbol + Versionsinfo, von `build.rs`
    ohne `rc.exe` als `.res` eingebettet; Quellen und Generator in `assets/`.)*
 3. **v0.3 (dieser Stand)**: Zero-Copy-Pfad *(erledigt)*; Widgets Uhr und Flight Control (Mission-Control-Modul mit
-   Countdown-Effekten) *(erledigt)*; Deep Space Clock, Signal Analyzer und DSN Now *(erledigt)*;
+   Countdown-Effekten) *(erledigt)*; Deep Space Clock, Signal Analyzer, DSN Now und ISS Tracker *(erledigt)*;
    offen: `gpu = "auto"` nach Monitor-Anschluss.
 4. **v0.4**: Linux (Wayland zuerst).

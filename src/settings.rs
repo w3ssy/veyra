@@ -787,6 +787,7 @@ impl Settings {
             ("dsc", wd.deep_space_clock.enabled, wd.deep_space_clock.position),
             ("analyzer", wd.signal_analyzer.enabled, wd.signal_analyzer.position),
             ("dsn", wd.dsn.enabled, wd.dsn.position),
+            ("iss", wd.iss.enabled, wd.iss.position),
         ]
         .into_iter()
         .filter(|(_, on, _)| *on)
@@ -889,6 +890,22 @@ impl Settings {
                 ui,
                 "Mit Internetzugriff: lädt jede Minute den öffentlichen Antennenstatus von eyes.nasa.gov (nur lesend). \
                  Gesendet wird nur die Anfrage selbst; ist das Widget aus, gibt es keinen Netzwerkzugriff.",
+            );
+        });
+
+        ui.add_space(12.0);
+        widget_card(ui, "iss", &mut wd.iss.enabled, &mut wd.iss.position, &others("iss"), |ui, enabled| {
+            title(
+                ui,
+                "ISS Tracker",
+                "Wo die Internationale Raumstation gerade ist – als Minimap, die mitscrollt: Bodenspur, Sichtbarkeitsradius, Tag und Nacht, Höhe und Geschwindigkeit.",
+                enabled,
+            );
+        }, |ui| {
+            note(
+                ui,
+                "Mit Internetzugriff: lädt alle 6 Stunden die öffentlichen Bahndaten der ISS von celestrak.org (nur lesend). \
+                 Die Position berechnet Veyra daraus selbst – sie läuft also auch offline weiter. Ist das Widget aus, gibt es keinen Netzwerkzugriff.",
             );
         });
     }

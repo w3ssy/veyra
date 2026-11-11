@@ -85,6 +85,7 @@ pub struct Widgets {
     pub deep_space_clock: DeepSpaceClockWidget,
     pub signal_analyzer: SignalAnalyzerWidget,
     pub dsn: DsnWidget,
+    pub iss: IssWidget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +158,14 @@ impl AnalyzerMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DsnWidget {
+    pub enabled: bool,
+    pub position: Position,
+}
+
+/// Wo die ISS gerade ist – als Minimap. Lädt alle 6 Stunden die Bahndaten von celestrak.org – standardmäßig aus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssWidget {
     pub enabled: bool,
     pub position: Position,
 }
@@ -235,6 +244,7 @@ impl Default for Widgets {
             deep_space_clock: DeepSpaceClockWidget::default(),
             signal_analyzer: SignalAnalyzerWidget::default(),
             dsn: DsnWidget::default(),
+            iss: IssWidget::default(),
         }
     }
 }
@@ -269,9 +279,15 @@ impl Default for DsnWidget {
     }
 }
 
+impl Default for IssWidget {
+    fn default() -> Self {
+        Self { enabled: false, position: Position::Bottom }
+    }
+}
+
 impl Widgets {
     pub fn any_enabled(&self) -> bool {
-        self.clock.enabled || self.flight_control.enabled || self.deep_space_clock.enabled || self.signal_analyzer.enabled || self.dsn.enabled
+        self.clock.enabled || self.flight_control.enabled || self.deep_space_clock.enabled || self.signal_analyzer.enabled || self.dsn.enabled || self.iss.enabled
     }
 
     /// Zeigt dieser Monitor die Widgets? (`index` ab 0)
@@ -694,6 +710,10 @@ pub fn render(cfg: &Config) -> String {
     line(format!("enabled = {}", wd.dsn.enabled), "NASA Deep Space Network live (lädt jede Minute Daten von eyes.nasa.gov)");
     line(format!("position = \"{}\"", wd.dsn.position.as_str()), "");
     line(String::new(), "");
+    line("[widgets.iss]".into(), "");
+    line(format!("enabled = {}", wd.iss.enabled), "ISS als Minimap (lädt alle 6 Stunden Bahndaten von celestrak.org)");
+    line(format!("position = \"{}\"", wd.iss.position.as_str()), "");
+    line(String::new(), "");
     line("# Ein Block pro Wallpaper. monitor = \"all\", \"primary\" oder 1, 2, 3 … (von links nach rechts).".into(), "");
     line("# Ein spezifischer Eintrag (Nummer) hat Vorrang vor \"primary\", das wiederum vor \"all\".".into(), "");
     line("# video = '' lässt den Monitor beim normalen Windows-Hintergrund.".into(), "");
@@ -773,6 +793,7 @@ mod tests {
         cfg.widgets.deep_space_clock = DeepSpaceClockWidget { enabled: true, position: Position::Left, longitude: Some(-71.0589), mars: false };
         cfg.widgets.signal_analyzer = SignalAnalyzerWidget { enabled: true, position: Position::Bottom, mode: AnalyzerMode::Xy };
         cfg.widgets.dsn = DsnWidget { enabled: true, position: Position::Right };
+        cfg.widgets.iss = IssWidget { enabled: true, position: Position::TopLeft };
         cfg.wallpapers = vec![
             Wallpaper { video: PathBuf::from(r"C:\Videos\a b.mp4"), ..Default::default() },
             Wallpaper { monitor: MonitorSel::Index(2), video: PathBuf::new(), fit: Fit::Contain, effect: Effect::Glow, intensity: 2.5 },

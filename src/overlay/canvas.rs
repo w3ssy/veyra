@@ -40,6 +40,8 @@ pub struct Canvas {
     /// Ursprung der Zeichenkoordinaten im Puffer (Schattenrand plus ggf. Innenabstand eines Panels).
     ox: f32,
     oy: f32,
+    /// Nur innerhalb dieses Rechtecks zeichnen (Pufferkoordinaten, x0, y0, x1, y1) – gilt für Formen.
+    clip: Option<(f32, f32, f32, f32)>,
     back: Vec<Px>,
     fore: Vec<Px>,
     glow: Option<Vec<Px>>,
@@ -51,13 +53,18 @@ impl Canvas {
         let pad = shadow_radius(scale) as u32 * 3 + 2;
         let (w, h) = (w + 2 * pad, h + 2 * pad);
         let n = (w * h) as usize;
-        Self { w, h, pad, ox: pad as f32, oy: pad as f32, back: vec![[0.0; 4]; n], fore: vec![[0.0; 4]; n], glow: None }
+        Self { w, h, pad, ox: pad as f32, oy: pad as f32, clip: None, back: vec![[0.0; 4]; n], fore: vec![[0.0; 4]; n], glow: None }
     }
 
     /// Zeichenkoordinaten ab jetzt relativ zu `(x, y)` (in Pixeln, bezogen auf den Inhalt ohne Schattenrand).
     pub fn set_origin(&mut self, x: f32, y: f32) {
         self.ox = self.pad as f32 + x.round();
         self.oy = self.pad as f32 + y.round();
+    }
+
+    /// Formen (Linien, Kreise, Dreiecke, Rechtecke) ab jetzt nur innerhalb von `r` zeichnen; `None` hebt das auf.
+    pub fn set_clip(&mut self, r: Option<(f32, f32, f32, f32)>) {
+        self.clip = r.map(|(x0, y0, x1, y1)| (x0 + self.ox, y0 + self.oy, x1 + self.ox, y1 + self.oy));
     }
 
     /// Wo der aktuelle Ursprung im fertigen Bild liegt (inkl. Schattenrand).
@@ -92,10 +99,13 @@ impl Canvas {
     fn shape(&mut self, l: Layer, bounds: (f32, f32, f32, f32), color: Color, dist: impl Fn(f32, f32) -> f32) {
         let (ox, oy, w, h) = (self.ox, self.oy, self.w, self.h);
         let c = premul(color);
+        let clip = self.clip.unwrap_or((0.0, 0.0, w as f32, h as f32));
         let buf = self.buf(l);
         let (x0, y0, x1, y1) = bounds;
-        for y in (y0 + oy - 1.0).floor() as i32..=(y1 + oy + 1.0).ceil() as i32 {
-            for x in (x0 + ox - 1.0).floor() as i32..=(x1 + ox + 1.0).ceil() as i32 {
+        let ys = ((y0 + oy - 1.0).floor().max(clip.1.floor()) as i32)..=((y1 + oy + 1.0).ceil().min(clip.3.ceil() - 1.0) as i32);
+        let xs = ((x0 + ox - 1.0).floor().max(clip.0.floor()) as i32)..=((x1 + ox + 1.0).ceil().min(clip.2.ceil() - 1.0) as i32);
+        for y in ys {
+            for x in xs.clone() {
                 let d = dist(x as f32 + 0.5 - ox, y as f32 + 0.5 - oy);
                 Self::put(buf, w, h, x, y, c, (0.5 - d).clamp(0.0, 1.0));
             }

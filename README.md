@@ -29,8 +29,8 @@ Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschle
 - ⏸️ **Pause bei ausgeschaltetem Bildschirm** – spart Strom, wenn die Monitore in den Standby gehen
 - 🧭 **Tray-Icon** mit Menü (passt sich heller/dunkler Taskleiste an) und **Autostart** mit Windows
 - 📌 **An Start und Taskleiste anheften** – über einen optionalen Startmenü-Eintrag
-- 🕐 **Widgets** – Uhr, **Flight Control**, **Deep Space Clock**, **Signal Analyzer** und **DSN Now** über dem
-  Video, in der Raumfahrt-Schrift Orbitron, jedes Widget an einer von 9 Positionen
+- 🕐 **Widgets** – Uhr, **Flight Control**, **Deep Space Clock**, **Signal Analyzer**, **DSN Now** und **ISS Tracker**
+  über dem Video, als Dashboard-Panels in der Raumfahrt-Schrift Orbitron, jedes Widget an einer von 9 Positionen
 - 🚀 **Flight Control** – der nächste Raketenstart weltweit als Mission-Control-Modul: Countdown mit
   *Terminal Count* und *Liftoff*-Effekt, die Rakete als Sensor-Scan, Mission-Patch im Instrumenten-Ring
 - 🛰️ **Deep Space Clock** – UTC, Julianisches Datum, Sternzeit, Mars-Zeit (MTC) und Ortszeit samt Sol der Rover
@@ -39,17 +39,20 @@ Kein Browser, keine Skripte, kein Netzwerk¹ – nur dein Video, hardwarebeschle
   Spektrum (48 Bänder mit Spitzenwerten), getriggertes Oszilloskop oder XY-Goniometer
 - 📡 **DSN Now** – live aus dem NASA Deep Space Network: welche Antenne in Goldstone, Madrid und Canberra gerade
   mit welcher Raumsonde funkt, mit Datenrate, Signallaufzeit und Entfernung auf einer Lichtlaufzeit-Skala
+- 🌍 **ISS Tracker** – die Raumstation als Minimap, die mitscrollt: Bodenspur, Sichtbarkeitsradius, Tag-Nacht-Grenze,
+  Höhe, Geschwindigkeit und Umlauf – die Bahn rechnet Veyra selbst, auch offline
 - 🔒 **Sicher by Design** – kein Browser, keine Skripte, kein Netzwerk¹, keine Adminrechte
 - 🪶 **Eine einzige EXE** – keine DLLs, keine Installation
 
 Linux ist architektonisch vorbereitet (siehe [docs/ARCHITEKTUR.md](docs/ARCHITEKTUR.md)).
 
-¹ Einzige Ausnahmen: die Widgets *Flight Control* und *DSN Now* – beide standardmäßig aus. Ist Flight Control
+¹ Einzige Ausnahmen: die Widgets *Flight Control*, *DSN Now* und *ISS Tracker* – alle standardmäßig aus. Ist Flight Control
 aktiv, fragt Veyra alle 15 Minuten die öffentlichen Startdaten der [Launch Library 2](https://thespacedevs.com/llapi)
 ab und lädt Raketenfoto und Mission-Patch der nächsten Starts aus deren Bildablage (zwei fest eingebaute
 HTTPS-Adressen, nur lesend). DSN Now holt einmal pro Minute den öffentlichen Antennenstatus von
-[eyes.nasa.gov](https://eyes.nasa.gov/dsn/dsn.html) (eine fest eingebaute Adresse, nur lesend).
-Ohne diese beiden Widgets gibt es keinen einzigen Netzwerkaufruf.
+[eyes.nasa.gov](https://eyes.nasa.gov/dsn/dsn.html) (eine fest eingebaute Adresse, nur lesend). Der ISS Tracker lädt
+alle 6 Stunden die Bahndaten der ISS von [CelesTrak](https://celestrak.org) (eine fest eingebaute Adresse, nur lesend).
+Ohne diese drei Widgets gibt es keinen einzigen Netzwerkaufruf.
 
 ## Warum Veyra?
 
@@ -61,8 +64,8 @@ Videos effizient als Hintergrund abspielen.
 |---|---|
 | Laufzeit | Kein Browser, nur Videodateien |
 | Fremder Code | Kein Skripting, keine Plugins, keine Downloads |
-| Netzwerk | Keiner – außer du schaltest Flight Control oder DSN Now ein (dann nur fest eingebaute Adressen) |
-| Codebasis | ~9.300 Zeilen Rust, 11 direkte Abhängigkeiten |
+| Netzwerk | Keiner – außer du schaltest Flight Control, DSN Now oder den ISS Tracker ein (dann nur fest eingebaute Adressen) |
+| Codebasis | ~10.500 Zeilen Rust, 11 direkte Abhängigkeiten |
 | Rechenlast | Zeichnet nur, wenn ein neues Videobild fällig ist, Bilder verlassen nie den Grafikspeicher – und pausiert, wenn niemand hinsieht |
 
 ## Download
@@ -97,8 +100,8 @@ Logo oder Symbol geändert? Die Icons in `assets/` neu erzeugen mit `python asse
    - oben deine Monitore in ihrer echten Anordnung, mit Vorschau des jeweiligen Videos,
    - „Ein Video für alle Monitore“ abwählen, um jedem Monitor ein eigenes Video zu geben,
    - Video per **Durchsuchen…**, Klick in der **Bibliothek** oder per **Drag & Drop** auf einen Monitor zuweisen,
-   - unter **Widgets**: Uhr, Flight Control, Deep Space Clock, Signal Analyzer und DSN Now einschalten und per
-     Klick auf den Mini-Monitor platzieren,
+   - unter **Widgets**: Uhr, Flight Control, Deep Space Clock, Signal Analyzer, DSN Now und ISS Tracker einschalten
+     und per Klick auf den Mini-Monitor platzieren,
    - unter **Allgemein**: Autostart, Pausen-Regeln, Bildrate, Grafikkarte, Audio-Reaktion.
 3. **Speichern** (oder Strg+S) – Veyra übernimmt die Änderung sofort.
 
@@ -140,6 +143,10 @@ mode = "spectrum"        # "spectrum", "wave" (Oszilloskop) oder "xy" (Goniomete
 [widgets.dsn]
 enabled = true
 position = "top-left"
+
+[widgets.iss]
+enabled = true
+position = "bottom"
 
 [[wallpaper]]
 monitor = "all"
@@ -201,3 +208,5 @@ Eingebettete Schrift: [Orbitron](https://github.com/theleagueof/orbitron) © The
 [SIL Open Font License 1.1](assets/Orbitron-OFL.txt).
 Startdaten, Fotos und Mission-Patches: [Launch Library 2](https://thespacedevs.com/llapi) von The Space Devs;
 die Rechte an Fotos und Patches liegen bei den jeweiligen Urhebern.
+Weltkarte des ISS Trackers: [Natural Earth](https://www.naturalearthdata.com) (gemeinfrei), umgerechnet mit
+[assets/make_land.py](assets/make_land.py). Bahndaten der ISS: [CelesTrak](https://celestrak.org).

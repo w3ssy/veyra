@@ -165,6 +165,14 @@ fn preview() {
     let img = super::clockface::render(&clock, &fonts, 1.0);
     write_png(&dir.join("clock.png"), img.width, img.height, &compose(&img, None));
 
+    let tle = super::orbit::tests::iss();
+    let iss_now = super::iss::content(super::iss::View::Live(tle.clone()), tle.epoch as i64 + 2400);
+    let img = super::iss::render(&iss_now, &fonts, 1.0, super::iss::WIDTH);
+    write_png(&dir.join("iss_tracker.png"), img.width, img.height, &compose(&img, None));
+    let iss_night = super::iss::content(super::iss::View::Live(tle.clone()), tle.epoch as i64 + 4300);
+    let img = super::iss::render(&iss_night, &fonts, 1.0, super::iss::WIDTH);
+    write_png(&dir.join("iss_tracker_2.png"), img.width, img.height, &compose(&img, None));
+
     let mut cache = flight::Cache::default();
     let fl = flight::content(rocket(now + 21_447), now);
     let img = flight::render(&fl, &fonts, 1.0, &mut cache, flight::WIDTH);
@@ -182,6 +190,7 @@ fn preview() {
                 (Position::BottomLeft, vec![Widget::Flight(Box::new(fl.clone()))]),
                 (Position::BottomRight, vec![ana.clone()]),
                 (Position::Center, vec![Widget::Clock(Box::new(clock.clone()))]),
+                (Position::Bottom, vec![Widget::Iss(Box::new(iss_now.clone()))]),
             ],
         ),
         (
