@@ -220,6 +220,20 @@ const H: f32 = MAP_Y + MAP_H + 36.0;
 /// Abstand der Kartenpunkte in Grad – fest an der Erde, damit sie beim Scrollen mitwandern.
 const DOT: f64 = 2.0;
 
+/// Beschriftung: Name, Kartenpunkt (Breite, Länge) etwa in der Mitte, Ozean (zarter, ohne Schild)?
+const LABELS: &[(&str, f64, f64, bool)] = &[
+    ("NORTH AMERICA", 45.0, -100.0, false),
+    ("SOUTH AMERICA", -12.0, -58.0, false),
+    ("EUROPE", 52.0, 18.0, false),
+    ("AFRICA", 5.0, 20.0, false),
+    ("ASIA", 50.0, 95.0, false),
+    ("AUSTRALIA", -25.0, 134.0, false),
+    ("ANTARCTICA", -78.0, 40.0, false),
+    ("PACIFIC OCEAN", 5.0, -145.0, true),
+    ("ATLANTIC OCEAN", 15.0, -40.0, true),
+    ("INDIAN OCEAN", -20.0, 78.0, true),
+];
+
 /// `w` = Außenbreite des Panels (mindestens [`WIDTH`]), bei Skalierung 1.
 pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> (Image, Option<RadarSpot>) {
     let iw = hud::inner(w);
@@ -302,6 +316,31 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> (Image, Option<RadarSpo
         }
     }
 
+    // Kontinentnamen zur Orientierung; nicht direkt unter dem ISS-Symbol.
+    let km_px = (1000.0 / (111.32 * clat.to_radians().cos().max(0.2) * k)) as f32;
+    let iss_px = d.pos.as_ref().map(|p| proj(p.lat as f64, p.lon as f64));
+    for &(name, lat, lon, ocean) in LABELS {
+        let (x, y0) = proj(lat, lon);
+        let l = hud::tiny(name, if ocean { cyan(150) } else { [255, 255, 255, 215] });
+        let lw = text::width(fonts, &l, s);
+        let (px, py) = (4.0 * s, 3.0 * s);
+        // Liegt der Name im Weg, ein Stück nach unten oder oben ausweichen statt ihn wegzulassen.
+        let place = [0.0, 1.0, -1.0, 2.0, -2.0].into_iter().map(|n| y0 + n * 22.0 * s).find(|&y| {
+            let plate = (x - lw / 2.0 - px, y - 4.0 * s - py, x + lw / 2.0 + px, y + 5.0 * s + py);
+            // Nur ganz sichtbare Namen, sonst hängen halbe Wörter am Kartenrand.
+            let inside = plate.0 >= mx0 + 2.0 && plate.2 <= mx1 - 2.0 && plate.1 >= my0 + 2.0 && plate.3 <= my1 - 2.0;
+            let on_iss = iss_px.is_some_and(|(ix, iy)| (ix - x).abs() < lw / 2.0 + 24.0 * s && (iy - y).abs() < 24.0 * s);
+            // Maßstab unten links freihalten.
+            let on_scale = plate.0 < mx0 + km_px + 70.0 * s && plate.3 > my1 - 20.0 * s;
+            inside && !on_iss && !on_scale
+        });
+        let Some(y) = place else { continue };
+        if !ocean {
+            c.rect(Layer::Fore, (x - lw / 2.0 - px, y - 4.0 * s - py, x + lw / 2.0 + px, y + 5.0 * s + py), [2, 8, 16, 190]);
+        }
+        c.text(Layer::Fore, fonts, &l, s, x - lw / 2.0, y - 4.0 * s);
+    }
+
     let mut spot = None;
     match &d.pos {
         Some(p) => {
@@ -334,7 +373,6 @@ pub fn render(d: &Iss, fonts: &Fonts, s: f32, w: f32) -> (Image, Option<RadarSpo
     let n = hud::tiny("N", cyan(220));
     let nw = text::width(fonts, &n, s);
     c.text(Layer::Fore, fonts, &n, s, nx - nw / 2.0, ny + 7.0 * s);
-    let km_px = (1000.0 / (111.32 * clat.to_radians().cos().max(0.2) * k)) as f32;
     let (bx, by) = (mx0 + 10.0 * s, my1 - 10.0 * s);
     c.line(Layer::Fore, (bx, by), (bx + km_px, by), 1.0, cyan(200));
     for x in [bx, bx + km_px] {
